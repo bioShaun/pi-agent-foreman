@@ -1,6 +1,7 @@
+import { shortenDisplayPath, truncate } from "./format-display.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
-import type { ReviewFinding, ReviewVerdictKind, ReviewVerdictPayload } from "./types.ts";
+import type { AgentTask, ReviewFinding, ReviewVerdictKind, ReviewVerdictPayload } from "./types.ts";
 
 const VALID_VERDICTS = new Set<string>(["approve", "revise", "reject"]);
 const VALID_SEVERITIES = new Set<string>(["critical", "major", "minor", "nit"]);
@@ -200,6 +201,19 @@ export interface ReviewContext {
 	rawReview?: string;
 }
 
+/** Whether exec should inject the latest failed review (not only when status is review_fail). */
+export function shouldIncorporateReviewOnExec(task: AgentTask): boolean {
+	if (task.status === "review_fail") return true;
+	if (task.status === "review_pass") return false;
+	if (!task.artifacts.review) return false;
+
+	const payload = loadReviewVerdictJson(task.artifacts.reviewVerdict);
+	if (payload) return !verdictPassed(payload);
+
+	// Review artifact exists but no JSON — e.g. legacy review or cancelled retry left status pending
+	return task.status === "pending" || task.status === "done" || task.status === "running";
+}
+
 export function loadReviewContext(
 	reviewMdPath: string | undefined,
 	reviewVerdictPath: string | undefined,
@@ -228,4 +242,59 @@ export function formatFindingsSummary(payload: ReviewVerdictPayload): string {
 	if (payload.findings.length === 0) return `Findings: 0 (${payload.verdict})`;
 	const bySeverity = payload.findings.map((f) => f.severity).join(", ");
 	return `Findings: ${payload.findings.length} [${bySeverity}] — ${payload.summary}`;
+}
+
+const SEVERITY_RANK: Record<ReviewFinding["severity"], number> = {
+	critical: 0,
+	major: 1,
+	minor: 2,
+	nit: 3,
+};
+
+/** Pinned loader lines for the review phase (scope + prior artifacts). */
+export function formatReviewPhaseLoaderContext(task: AgentTask, cwd: string): string[] {
+	const lines: string[] = ["↳ reviewing uncommitted git changes"];
+	if (task.artifacts.log) {
+		lines.push(`  exec: ${shortenDisplayPath(task.artifacts.log, cwd)}`);
+	}
+	const payload = loadReviewVerdictJson(task.artifacts.reviewVerdict);
+	if (payload) {
+		lines.push(
+			`  prior review: ${payload.review_run_id} (${payload.verdict} · ${payload.findings.length} finding${payload.findings.length === 1 ? "" : "s"})`,
+		);
+		if (payload.summary.trim()) {
+			lines.push(`  ${truncate(payload.summary, 72)}`);
+		}
+	} else if (task.artifacts.review) {
+		lines.push(`  prior review: ${runIdFromReviewPath(task.artifacts.review)}`);
+	}
+	if (task.title.trim()) {
+		lines.push(`  task: ${truncate(task.title, 72)}`);
+	}
+	return lines;
+}
+
+/** Pinned loader lines shown while re-exec incorporates a failed review. */
+export function formatReviewLoaderContext(ctx: ReviewContext, maxFindings = 3): string[] {
+	const lines: string[] = [];
+
+	if (ctx.payload) {
+		const { findings, summary, review_run_id: runId } = ctx.payload;
+		lines.push(`↳ loaded review ${runId} · ${findings.length} finding${findings.length === 1 ? "" : "s"}`);
+		if (summary.trim()) {
+			lines.push(`  ${truncate(summary, 76)}`);
+		}
+		const sorted = [...findings].sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
+		for (const f of sorted.slice(0, maxFindings)) {
+			const loc = f.file ? ` · ${f.file}${f.line !== undefined ? `:${f.line}` : ""}` : "";
+			lines.push(`  [${f.severity}] ${truncate(f.message, 56)}${loc}`);
+		}
+		if (findings.length > maxFindings) {
+			lines.push(`  … +${findings.length - maxFindings} more finding(s)`);
+		}
+		return lines;
+	}
+
+	lines.push(`↳ loaded review ${ctx.runId} · report (no structured findings)`);
+	return lines;
 }

@@ -3,7 +3,7 @@ import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, matchesKey, Spacer, Text } from "@earendil-works/pi-tui";
 import { watchAntigravityProgress } from "./antigravity-progress.ts";
 import { shortenDisplayPath } from "./format-display.ts";
-import { buildThemedLoaderText } from "./loader-theme.ts";
+import { buildThemedLoaderPinned, buildThemedLoaderProgress } from "./loader-theme.ts";
 import { appendLiveLog, ensureLiveOutputSection, initLiveLog } from "./live-log.ts";
 import {
 	isLoaderProgressLine,
@@ -36,6 +36,8 @@ export interface RunWithLoaderOptions {
 	jsonStream?: "claude" | "codex";
 	antigravityProgress?: boolean;
 	liveLogPath?: string;
+	/** Pinned context lines (e.g. loaded review findings) shown above progress. */
+	loaderContext?: string[];
 }
 
 export async function runWithLoader(
@@ -54,8 +56,10 @@ export async function runWithLoader(
 	}
 
 	if (options?.liveLogPath) {
-		initLiveLog(options.liveLogPath, label);
+		initLiveLog(options.liveLogPath, label, options.loaderContext);
 	}
+
+	const loaderContext = options?.loaderContext ?? [];
 
 	const cwd = options?.cwd ?? ctx.cwd;
 	const liveHint = options?.liveLogPath
@@ -67,10 +71,12 @@ export async function runWithLoader(
 	return ctx.ui.custom<RunResult>((tui, theme, _kb, done) => {
 		const container = new Container();
 		const border = new DynamicBorder((s: string) => theme.fg("border", s));
-		const output = new Text("", 1, 0);
+		const pinnedOutput = new Text("", 1, 0);
+		const progressOutput = new Text("", 1, 0);
 
 		container.addChild(border);
-		container.addChild(output);
+		container.addChild(pinnedOutput);
+		container.addChild(progressOutput);
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(theme.fg("dim", `Esc cancel · tail -f ${liveHint}`), 1, 0));
 		container.addChild(border);
@@ -86,7 +92,9 @@ export async function runWithLoader(
 		const fallback = loaderFallback(options);
 
 		const refresh = () => {
-			output.setText(buildThemedLoaderText(theme, label, Date.now() - started, recentLines, fallback));
+			const elapsedMs = Date.now() - started;
+			pinnedOutput.setText(buildThemedLoaderPinned(theme, label, elapsedMs, loaderContext));
+			progressOutput.setText(buildThemedLoaderProgress(theme, recentLines, fallback));
 			redraw();
 		};
 

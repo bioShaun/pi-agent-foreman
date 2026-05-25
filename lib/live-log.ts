@@ -8,9 +8,10 @@ const MARKERS: Record<LiveLogSection, string> = {
 	output: "## Output",
 };
 
-export function initLiveLog(path: string, header: string): void {
+export function initLiveLog(path: string, header: string, contextLines: string[] = []): void {
 	ensureRunDirs(path);
-	writeFileSync(path, `# ${header}\n\n${MARKERS.progress}\n`, "utf-8");
+	const context = contextLines.length > 0 ? `\n${contextLines.join("\n")}\n` : "\n";
+	writeFileSync(path, `# ${header}${context}\n${MARKERS.progress}\n`, "utf-8");
 }
 
 export function appendLiveLog(path: string | undefined, section: LiveLogSection, line: string): void {

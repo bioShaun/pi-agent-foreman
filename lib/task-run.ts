@@ -9,12 +9,17 @@ import { writePromptSnapshot } from "./prompt-persistence.ts";
 import {
 	extractReviewVerdictFromBody,
 	formatFindingsSummary,
+	formatReviewLoaderContext,
+	formatReviewPhaseLoaderContext,
 	loadReviewContext,
+	type ReviewContext,
 	reviewPassed,
+	shouldIncorporateReviewOnExec,
 	writeReviewVerdictJson,
 } from "./review-verdict.ts";
 import {
 	execHintAfterReviewFail,
+	execRevertStatus,
 	formatReviewVerdict,
 	reviewStatusFromVerdict,
 } from "./task-status.ts";
@@ -28,6 +33,7 @@ export interface InvokeSpec {
 	jsonStream?: "claude" | "codex";
 	antigravityProgress?: boolean;
 	liveLogPath?: string;
+	loaderContext?: string[];
 	timeoutMs?: number;
 }
 
@@ -66,8 +72,32 @@ export function makeInvokeAdapter(pi: ExtensionAPI, ctx: ExtensionCommandContext
 			jsonStream: spec.jsonStream,
 			antigravityProgress: spec.antigravityProgress,
 			liveLogPath: spec.liveLogPath,
+			loaderContext: spec.loaderContext,
 			timeoutMs: spec.timeoutMs,
 		});
+}
+
+function resolveExecReviewLoad(
+	task: AgentTask,
+	taskId: string,
+): { incorporatingReview: boolean; reviewContext?: ReviewContext; loaderContext?: string[] } {
+	if (!shouldIncorporateReviewOnExec(task)) {
+		return { incorporatingReview: false };
+	}
+
+	const reviewContext = loadReviewContext(task.artifacts.review, task.artifacts.reviewVerdict, taskId);
+	if (reviewContext) {
+		return {
+			incorporatingReview: true,
+			reviewContext,
+			loaderContext: formatReviewLoaderContext(reviewContext),
+		};
+	}
+
+	const hint = task.artifacts.review
+		? `↳ review_fail · could not read ${task.artifacts.review}`
+		: "↳ review_fail · no review artifact on task";
+	return { incorporatingReview: true, loaderContext: [hint] };
 }
 
 function workerFailureDetail(result: { stdout: string; stderr: string }, logBody: string): string {
@@ -82,11 +112,10 @@ export async function runExecPhase(
 	const task = loadTask(deps.cwd, taskId);
 	if (!task) throw new Error(`Task not found: ${taskId}`);
 
-	const reviewContext =
-		task.status === "review_fail"
-			? loadReviewContext(task.artifacts.review, task.artifacts.reviewVerdict, taskId)
-			: undefined;
+	const priorStatus = task.status;
+	const { incorporatingReview, reviewContext, loaderContext } = resolveExecReviewLoad(task, taskId);
 	const { agent, prompt, invocation } = workerInvocation(deps.cwd, worker, task.prompt, reviewContext);
+	const revertStatus = execRevertStatus(priorStatus, incorporatingReview);
 
 	const runId = createRunId(worker);
 	const startedAt = new Date().toISOString();
@@ -108,13 +137,16 @@ export async function runExecPhase(
 
 	try {
 		const result = await deps.invoke({
-			label: `Executing ${taskId} with ${agent.cli}`,
+			label: incorporatingReview
+				? `Executing ${taskId} with ${agent.cli} · review retry`
+				: `Executing ${taskId} with ${agent.cli}`,
 			command: invocation.command,
 			args: invocation.args,
 			stdin: invocation.stdin,
 			jsonStream: invocation.jsonStream,
 			antigravityProgress: invocation.antigravityProgress,
 			liveLogPath: live,
+			loaderContext,
 			timeoutMs: 60 * 60 * 1000,
 		});
 
@@ -133,7 +165,7 @@ export async function runExecPhase(
 		};
 
 		if (result.killed) {
-			patchTaskStatus(deps, taskId, "pending", {
+			patchTaskStatus(deps, taskId, revertStatus, {
 				artifacts: { log: logPath, liveTrace: live, execPrompt: promptPath },
 				run,
 			});
@@ -141,7 +173,7 @@ export async function runExecPhase(
 		}
 
 		if (result.code !== 0) {
-			patchTaskStatus(deps, taskId, "pending", {
+			patchTaskStatus(deps, taskId, revertStatus, {
 				artifacts: { log: logPath, liveTrace: live, execPrompt: promptPath },
 				run,
 			});
@@ -158,8 +190,8 @@ export async function runExecPhase(
 			run,
 		});
 
-		const retryNote = reviewContext
-			? ` (from review ${reviewContext.runId}${reviewContext.payload ? `, ${reviewContext.payload.findings.length} finding(s)` : ""})`
+		const retryNote = incorporatingReview
+			? ` (from review ${reviewContext?.runId ?? "unknown"}${reviewContext?.payload ? `, ${reviewContext.payload.findings.length} finding(s)` : ""})`
 			: "";
 		const summary = [
 			`${taskId} done (${agent.cli})${retryNote}`,
@@ -172,7 +204,7 @@ export async function runExecPhase(
 	} catch (err) {
 		const current = loadTask(deps.cwd, taskId);
 		if (current?.status === "running") {
-			patchTaskStatus(deps, taskId, "pending", { worker });
+			patchTaskStatus(deps, taskId, revertStatus, { worker });
 		}
 		throw err;
 	}
@@ -210,6 +242,7 @@ export async function runReviewPhase(
 		stdin: invocation.stdin,
 		jsonStream: invocation.jsonStream,
 		liveLogPath: live,
+		loaderContext: formatReviewPhaseLoaderContext(task, deps.cwd),
 		timeoutMs: 30 * 60 * 1000,
 	});
 
