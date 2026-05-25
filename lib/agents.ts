@@ -9,6 +9,7 @@ import {
 	type ReviewContext,
 } from "./review-verdict.ts";
 import { buildRoleInvocation, type RoleInvocation } from "./role-invoke.ts";
+import { cliBinCandidates } from "./cli-resolve.ts";
 import { which } from "./run-command.ts";
 import type { Reviewer, Worker } from "./types.ts";
 

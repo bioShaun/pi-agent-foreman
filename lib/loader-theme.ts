@@ -60,6 +60,19 @@ function formatEditArgs(theme: LoaderTheme, args: string): string {
 		.join(theme.fg("syntaxPunctuation", ", "));
 }
 
+function formatShellCommand(theme: LoaderTheme, args: string): string {
+	if (args.includes(" │")) {
+		const [head, tail] = args.split(" │", 2);
+		return theme.fg("syntaxFunction", head!) + theme.fg("dim", ` │${tail ?? "…"}`);
+	}
+	const tool = args.match(/^(pytest|git|python(?:3)?|rg|grep|sed|nl|cat|find|wc)\b/i)?.[1];
+	if (tool) {
+		const rest = args.slice(tool.length);
+		return theme.fg("toolTitle", theme.bold(tool.toLowerCase())) + theme.fg("mdCode", rest);
+	}
+	return theme.fg("bashMode", args);
+}
+
 function formatProgressLine(theme: LoaderTheme, line: string): string {
 	const failed = line.endsWith(" (failed)");
 	const body = failed ? line.slice(0, -" (failed)".length) : line;
@@ -98,7 +111,7 @@ function formatProgressLine(theme: LoaderTheme, line: string): string {
 	else if (verb === "mcp") out += theme.fg("accent", args);
 	else if (verb === "edit" && /^(update|delete|add|rename)\s/i.test(args)) out += formatEditArgs(theme, args);
 	else if (FILE_TOOLS.has(verb)) out += formatFileTarget(theme, args);
-	else out += theme.fg("bashMode", args);
+	else out += formatShellCommand(theme, args);
 
 	if (failed) out += theme.fg("error", " (failed)");
 	return out;

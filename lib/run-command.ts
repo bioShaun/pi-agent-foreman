@@ -90,13 +90,23 @@ export async function runWithLoader(
 			redraw();
 		};
 
+		let refreshCoalescing = false;
+		const scheduleRefresh = () => {
+			if (refreshCoalescing) return;
+			refreshCoalescing = true;
+			setImmediate(() => {
+				refreshCoalescing = false;
+				refresh();
+			});
+		};
+
 		refresh();
 
 		const onProgressLine = (line: string, filterStructured = structured) => {
 			if (filterStructured && !isLoaderProgressLine(line)) return;
 			pushDisplayLine(recentLines, line);
 			appendLiveLog(options?.liveLogPath, "progress", line);
-			refresh();
+			scheduleRefresh();
 		};
 
 		const onOutputLine = (line: string) => {

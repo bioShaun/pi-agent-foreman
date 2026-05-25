@@ -1,5 +1,7 @@
+import { summarizeShellCommand } from "./format-display.ts";
+
 const MAX_RECENT = 80;
-const TAIL_LINES = 12;
+const TAIL_LINES = 8;
 
 function tail(text: string, lines: number): string {
 	const parts = text.trim().split("\n");
@@ -46,16 +48,23 @@ export function isLoaderProgressLine(line: string): boolean {
 	return false;
 }
 
+function progressDedupeKey(line: string): string {
+	const body = line.replace(/^\$ /, "").replace(/ \(failed\)$/, "");
+	return summarizeShellCommand(body, 160);
+}
+
 export function pushDisplayLine(recentLines: string[], line: string): void {
 	const trimmed = line.trim();
 	if (!trimmed) return;
 
+	const key = progressDedupeKey(trimmed);
 	const last = recentLines[recentLines.length - 1];
 	if (last === "$ running command…" && trimmed.startsWith("$ ")) {
 		recentLines[recentLines.length - 1] = trimmed;
 		return;
 	}
 	if (last === trimmed) return;
+	if (last && progressDedupeKey(last) === key) return;
 
 	if (trimmed.startsWith("$ ") && last?.startsWith("$ ")) {
 		const lastCmd = last.replace(/ \(failed\)$/, "");

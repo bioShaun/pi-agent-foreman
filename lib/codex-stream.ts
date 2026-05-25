@@ -1,4 +1,4 @@
-import { progressLine, shortenDisplayPath, truncate } from "./format-display.ts";
+import { progressLine, shortenDisplayPath, summarizeShellCommand, truncate } from "./format-display.ts";
 
 export interface CodexStreamState {
 	textBuffer: string;
@@ -15,15 +15,11 @@ export interface CodexStreamLine {
 	line: string;
 }
 
-function normalizeCommand(command: string): string {
-	return command.replace(/^bash\s+-lc\s+/i, "").trim();
-}
-
 function formatCommandItem(item: Record<string, unknown>): string | undefined {
-	const command = typeof item.command === "string" ? normalizeCommand(item.command) : "";
-	if (!command) return undefined;
+	const command = typeof item.command === "string" ? item.command : "";
+	if (!command.trim()) return undefined;
 	const failed = item.status === "failed" ? " (failed)" : "";
-	return progressLine(`${truncate(command)}${failed}`);
+	return progressLine(`${summarizeShellCommand(command)}${failed}`);
 }
 
 function formatFileChangeItem(item: Record<string, unknown>): string | undefined {
@@ -47,7 +43,7 @@ function formatMcpToolItem(item: Record<string, unknown>): string | undefined {
 
 function summarizeCodexItem(item: Record<string, unknown>, eventType: string): CodexStreamLine | null {
 	const itemType = item.type;
-	if (itemType === "command_execution" && (eventType === "item.started" || eventType === "item.completed")) {
+	if (itemType === "command_execution" && eventType === "item.completed") {
 		const line = formatCommandItem(item);
 		return line ? { kind: "progress", line } : null;
 	}
