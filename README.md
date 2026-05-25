@@ -2,14 +2,15 @@
 
 [English](README.md) · [中文](README.zh-CN.md)
 
-Pi TUI extension: **Codex** plans and reviews; **Claude**, **Codex**, or **Antigravity (`agy`)** execute tasks — one `/agent` workflow.
+Pi TUI extension: **Codex** plans; **Claude** or **Codex** review; **Claude**, **Codex**, or **Antigravity (`agy`)** execute tasks — one `/agent` workflow.
 
 ## Prerequisites
 
 - [Pi](https://github.com/badlogic/pi-mono) coding agent (`pi install …`)
 - A **git repository** (Codex trusted directory)
 - CLIs on `PATH` for the roles you use:
-  - **Plan / review:** `codex`
+  - **Plan:** `codex`
+  - **Review:** `codex` (default), `claude` (`--reviewer claude`)
   - **Exec:** `claude`, and/or `codex`, and/or `agy` (Antigravity CLI)
 
 Install Antigravity CLI:
@@ -39,22 +40,26 @@ pi -e /path/to/pi-agent-foreman/index.ts
 |---------|-------------|
 | `/agent plan <goal>` | Codex generates a plan → tasks under `.agent/` |
 | `/agent list` | List tasks (widget also shows active plan in TUI) |
-| `/agent run T001 [--worker claude]` | Exec → review → **one auto-retry** if review fails |
+| `/agent run T001 [--worker claude] [--reviewer claude\|codex]` | Exec → review → **one auto-retry** if review fails |
 | `/agent exec T001 [--worker claude]` | Execute a single task |
 | `/agent exec --all [--worker claude]` | Exec all `pending` / `review_fail` tasks in active plan |
 | | Options: `--from T003`, `--continue-on-error` |
 | `/agent resume` | Resume last stopped batch from `boulder.json` |
 | `/agent resume --continue-on-error` | Resume and keep going after task failures |
 | `/agent resume status` | Show resume info without running |
-| `/agent review T001` | Codex review (uncommitted changes) |
+| `/agent review T001 [--reviewer claude\|codex]` | Review uncommitted changes (default: Codex) |
+| `/agent review --all [--reviewer claude\|codex]` | Review all `done` tasks in active plan |
+| | Options: `--from T003`, `--continue-on-error` |
 | `/agent logs T001` | Run history and artifact paths |
 | `/agent help` | Command reference |
 
-**Workers:** `--worker claude` (default) · `codex` · `antigravity`
+**Workers:** `--worker claude` (default) · `codex` · `antigravity`  
+**Reviewers:** `--reviewer codex` (default) · `claude`
 
 ```
 /agent plan Improve test coverage
 /agent exec --all --worker claude
+/agent review --all --reviewer claude
 /agent resume
 ```
 
@@ -68,15 +73,17 @@ Role agents are markdown files with YAML frontmatter. **Project overrides packag
 | `worker-claude.md` | Exec | `claude -p` (stream-json) |
 | `worker-codex.md` | Exec | `codex exec -` |
 | `worker-antigravity.md` | Exec | `agy -p` (Antigravity CLI) |
-| `reviewer.md` | Review | `codex exec review --uncommitted` |
+| `reviewer.md` | Review | `codex exec -` (stream-json + foreman-verdict) |
+| `reviewer-claude.md` | Review | `claude -p` (git diff + foreman-verdict) |
 
 Optional frontmatter:
 
 - `cli` — logical CLI name
 - `bin` — executable on `PATH` (e.g. `bin: agy` for Antigravity)
 - `worker` — worker id for exec (`claude`, `codex`, `antigravity`)
+- `reviewer` — reviewer id (`claude`, `codex`)
 
-After `review_fail`, re-running `/agent exec T001` injects the latest review artifact into the worker prompt.
+After `review_fail`, re-running `/agent exec T001` injects structured findings from `.agent/artifacts/review/T001/{runId}.json` (or falls back to the review report). Verify via `.agent/prompts/exec/T001/{runId}.md` (`incorporated_review_run_id` in frontmatter).
 
 ## Task lifecycle
 
@@ -99,7 +106,10 @@ Layout inspired by [oh-my-claudecode REFERENCE](https://github.com/Yeachan-Heo/o
 | Plan | `plans/PLAN-001.json`, `plans/PLAN-001.md` | Task list + raw plan markdown |
 | Task | `tasks/T001.json` | Status, artifacts, `runs[]` |
 | Exec log | `artifacts/exec/T001/{runId}.log` | Immutable per run |
-| Review | `artifacts/review/T001/{runId}.md` | Immutable per run |
+| Exec prompt | `prompts/exec/T001/{runId}.md` | Full worker prompt (audit) |
+| Review | `artifacts/review/T001/{runId}.md` | Narrative review report |
+| Review verdict | `artifacts/review/T001/{runId}.json` | Structured findings (`approve/revise/reject`) |
+| Review prompt | `prompts/review/T001/{runId}.md` | Full reviewer prompt (audit) |
 | Plan artifact | `artifacts/plan/PLAN-001/{runId}.md` | Codex plan output |
 | Live trace | `traces/T001/{runId}.live.log` | Stream tail while exec runs |
 

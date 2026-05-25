@@ -5,12 +5,8 @@ export function isExecRunnable(status: TaskStatus): boolean {
 	return status === "pending" || status === "review_fail" || status === "running";
 }
 
-export function shouldInjectReviewFeedback(status: TaskStatus): boolean {
-	return status === "review_fail";
-}
-
-export function parseReviewVerdict(body: string): boolean {
-	return /\bPASS\b/i.test(body) && !/\bFAIL\b/i.test(body.split("PASS").pop() ?? "");
+export function isReviewRunnable(status: TaskStatus): boolean {
+	return status === "done";
 }
 
 export function reviewStatusFromVerdict(passed: boolean): "review_pass" | "review_fail" {
@@ -30,7 +26,7 @@ export function isRunStillFailing(status: TaskStatus): boolean {
 }
 
 export function execHintAfterReviewFail(taskId: string, worker?: Worker): string {
-	return `\nNext: /agent exec ${taskId} --worker ${worker ?? "claude"}  (auto-applies review feedback)`;
+	return `\nNext: /agent exec ${taskId} --worker ${worker ?? "claude"}  (structured findings in exec prompt; verify .agent/prompts/exec/${taskId}/)`;
 }
 
 export function statusIcon(status: TaskStatus): string {

@@ -16,6 +16,7 @@ function ensureAgentDirs(cwd: string): void {
 	mkdirSync(join(root, "plans"), { recursive: true });
 	mkdirSync(join(root, "tasks"), { recursive: true });
 	mkdirSync(join(root, "artifacts"), { recursive: true });
+	mkdirSync(join(root, "prompts"), { recursive: true });
 	mkdirSync(join(root, "traces"), { recursive: true });
 }
 

@@ -1,6 +1,6 @@
 # Agent Foreman
 
-Pi TUI extension that orchestrates a multi-CLI pipeline: Codex plans and reviews; Claude/Codex/Antigravity execute tasks. All state lives under `.agent/` in the git repo.
+Pi TUI extension that orchestrates a multi-CLI pipeline: Codex plans; Claude or Codex review; Claude/Codex/Antigravity execute tasks. All state lives under `.agent/` in the git repo.
 
 ## Language
 
@@ -17,7 +17,7 @@ One invocation of a worker or reviewer CLI. Identified by `{UTC-ts}-{provider}`;
 _Avoid_: Attempt, execution, session
 
 **Run phase**:
-Which kind of run this is: `exec` (worker executes task), `review` (Codex reviews uncommitted changes), or `plan` (Codex generates a plan).
+Which kind of run this is: `exec` (worker executes task), `review` (Claude or Codex reviews uncommitted changes), or `plan` (Codex generates a plan).
 _Avoid_: Stage, step, action
 
 **Task run**:

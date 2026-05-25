@@ -1,9 +1,9 @@
 ---
-name: reviewer
+name: reviewer-claude
 role: reviewer
-cli: codex
-reviewer: codex
-description: Code review via Codex review
+cli: claude
+reviewer: claude
+description: Code review via Claude (git diff + tools)
 ---
 
 Review uncommitted changes for the given task.

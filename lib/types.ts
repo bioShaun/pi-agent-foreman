@@ -1,5 +1,13 @@
 export type TaskStatus = "pending" | "running" | "done" | "review_pass" | "review_fail";
 
+export const REVIEWERS = ["claude", "codex"] as const;
+
+export type Reviewer = (typeof REVIEWERS)[number];
+
+export function isReviewer(value: string): value is Reviewer {
+	return (REVIEWERS as readonly string[]).includes(value);
+}
+
 export const WORKERS = ["claude", "codex", "antigravity"] as const;
 
 export type Worker = (typeof WORKERS)[number];
@@ -8,18 +16,38 @@ export function isWorker(value: string): value is Worker {
 	return (WORKERS as readonly string[]).includes(value);
 }
 
+export type ReviewVerdictKind = "approve" | "revise" | "reject";
+
+export type ReviewFindingSeverity = "critical" | "major" | "minor" | "nit";
+
+export interface ReviewFinding {
+	severity: ReviewFindingSeverity;
+	message: string;
+	file?: string;
+	line?: number;
+}
+
+export interface ReviewVerdictPayload {
+	task_id: string;
+	review_run_id: string;
+	verdict: ReviewVerdictKind;
+	summary: string;
+	findings: ReviewFinding[];
+}
+
 export type RunPhase = "exec" | "review" | "plan";
 
 export interface TaskRun {
 	runId: string;
 	phase: RunPhase;
-	worker?: Worker | "codex";
+	worker?: Worker | "codex" | "claude";
 	startedAt: string;
 	endedAt?: string;
 	exitCode?: number;
 	paths: {
 		output?: string;
 		live?: string;
+		prompt?: string;
 	};
 }
 
@@ -63,6 +91,9 @@ export interface AgentTask {
 	artifacts: {
 		log?: string;
 		review?: string;
+		reviewVerdict?: string;
+		execPrompt?: string;
+		reviewPrompt?: string;
 		branch?: string;
 		liveTrace?: string;
 	};

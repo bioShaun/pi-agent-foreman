@@ -13,7 +13,10 @@ export function formatTaskLogs(cwd: string, taskId: string): string {
 
 	const lines: string[] = [`Run history for ${taskId}:`];
 	if (task.artifacts.log) lines.push(`Latest exec: ${task.artifacts.log}`);
+	if (task.artifacts.execPrompt) lines.push(`Latest exec prompt: ${task.artifacts.execPrompt}`);
 	if (task.artifacts.review) lines.push(`Latest review: ${task.artifacts.review}`);
+	if (task.artifacts.reviewVerdict) lines.push(`Latest verdict: ${task.artifacts.reviewVerdict}`);
+	if (task.artifacts.reviewPrompt) lines.push(`Latest review prompt: ${task.artifacts.reviewPrompt}`);
 	if (task.artifacts.liveTrace) lines.push(`Latest trace: ${task.artifacts.liveTrace}`);
 
 	const runs = task.runs ?? [];
@@ -28,6 +31,7 @@ export function formatTaskLogs(cwd: string, taskId: string): string {
 		const code = r.exitCode !== undefined ? ` exit=${r.exitCode}` : "";
 		lines.push(`- ${r.runId} [${r.phase}]${r.worker ? ` ${r.worker}` : ""}${code}${end}`);
 		if (r.paths.output) lines.push(`  output: ${r.paths.output}`);
+		if (r.paths.prompt) lines.push(`  prompt: ${r.paths.prompt}`);
 		if (r.paths.live) lines.push(`  live:   ${r.paths.live}`);
 	}
 	return lines.join("\n");

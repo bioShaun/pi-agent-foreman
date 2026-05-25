@@ -1,17 +1,24 @@
 import { writeFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { readReviewFeedback, reviewerInvocation, workerInvocation } from "./agents.ts";
+import { reviewerInvocation, workerInvocation } from "./agents.ts";
 import { runWithLoader, type RunResult } from "./run-command.ts";
-import { artifactPath, createRunId, ensureRunDirs, tracePath } from "./agent-paths.ts";
+import { tailLines } from "./run-display.ts";
+import { artifactPath, createRunId, ensureRunDirs, reviewVerdictPath, tracePath } from "./agent-paths.ts";
 import { loadTask, updateTaskStatus } from "./agent-store.ts";
+import { writePromptSnapshot } from "./prompt-persistence.ts";
+import {
+	extractReviewVerdictFromBody,
+	formatFindingsSummary,
+	loadReviewContext,
+	reviewPassed,
+	writeReviewVerdictJson,
+} from "./review-verdict.ts";
 import {
 	execHintAfterReviewFail,
 	formatReviewVerdict,
-	parseReviewVerdict,
 	reviewStatusFromVerdict,
-	shouldInjectReviewFeedback,
 } from "./task-status.ts";
-import type { AgentTask, TaskRun, TaskStatus, Worker } from "./types.ts";
+import type { AgentTask, Reviewer, TaskRun, TaskStatus, Worker } from "./types.ts";
 
 export interface InvokeSpec {
 	label: string;
@@ -63,11 +70,6 @@ export function makeInvokeAdapter(pi: ExtensionAPI, ctx: ExtensionCommandContext
 		});
 }
 
-function tailLines(text: string, lines = 8): string {
-	const parts = text.trim().split("\n").filter(Boolean);
-	return parts.slice(-lines).join("\n");
-}
-
 function workerFailureDetail(result: { stdout: string; stderr: string }, logBody: string): string {
 	return result.stderr.trim() || tailLines(result.stdout) || tailLines(logBody);
 }
@@ -80,16 +82,27 @@ export async function runExecPhase(
 	const task = loadTask(deps.cwd, taskId);
 	if (!task) throw new Error(`Task not found: ${taskId}`);
 
-	const reviewFeedback = shouldInjectReviewFeedback(task.status)
-		? readReviewFeedback(task.artifacts.review)
-		: undefined;
-	const { agent, invocation } = workerInvocation(deps.cwd, worker, task.prompt, reviewFeedback);
+	const reviewContext =
+		task.status === "review_fail"
+			? loadReviewContext(task.artifacts.review, task.artifacts.reviewVerdict, taskId)
+			: undefined;
+	const { agent, prompt, invocation } = workerInvocation(deps.cwd, worker, task.prompt, reviewContext);
 
 	const runId = createRunId(worker);
 	const startedAt = new Date().toISOString();
 	const logPath = artifactPath(deps.cwd, "exec", taskId, runId);
 	const live = tracePath(deps.cwd, taskId, runId);
 	ensureRunDirs(logPath, live);
+
+	const promptPath = writePromptSnapshot(deps.cwd, {
+		task_id: taskId,
+		phase: "exec",
+		run_id: runId,
+		cli: agent.cli,
+		worker,
+		incorporated_review_run_id: reviewContext?.runId,
+		finding_count: reviewContext?.payload?.findings.length,
+	}, prompt);
 
 	patchTaskStatus(deps, taskId, "running", { worker });
 
@@ -116,12 +129,12 @@ export async function runExecPhase(
 			startedAt,
 			endedAt,
 			exitCode: result.code,
-			paths: { output: logPath, live },
+			paths: { output: logPath, live, prompt: promptPath },
 		};
 
 		if (result.killed) {
 			patchTaskStatus(deps, taskId, "pending", {
-				artifacts: { log: logPath, liveTrace: live },
+				artifacts: { log: logPath, liveTrace: live, execPrompt: promptPath },
 				run,
 			});
 			throw new Error(`Execution cancelled (${taskId})`);
@@ -129,7 +142,7 @@ export async function runExecPhase(
 
 		if (result.code !== 0) {
 			patchTaskStatus(deps, taskId, "pending", {
-				artifacts: { log: logPath, liveTrace: live },
+				artifacts: { log: logPath, liveTrace: live, execPrompt: promptPath },
 				run,
 			});
 			const detail = workerFailureDetail(result, logBody);
@@ -140,14 +153,17 @@ export async function runExecPhase(
 
 		const updated = patchTaskStatus(deps, taskId, "done", {
 			worker,
-			artifacts: { log: logPath, liveTrace: live },
+			artifacts: { log: logPath, liveTrace: live, execPrompt: promptPath },
 			timestamps: { ...task.timestamps, executed: endedAt },
 			run,
 		});
 
-		const retryNote = reviewFeedback ? " (incorporating review feedback)" : "";
+		const retryNote = reviewContext
+			? ` (from review ${reviewContext.runId}${reviewContext.payload ? `, ${reviewContext.payload.findings.length} finding(s)` : ""})`
+			: "";
 		const summary = [
 			`${taskId} done (${agent.cli})${retryNote}`,
+			`Prompt: ${promptPath}`,
 			`Log: ${logPath}`,
 			`Live trace: ${live}`,
 		].join("\n");
@@ -165,21 +181,35 @@ export async function runExecPhase(
 export async function runReviewPhase(
 	deps: TaskRunDeps,
 	taskId: string,
+	reviewer?: Reviewer,
 ): Promise<{ summary: string; task: AgentTask; passed: boolean }> {
 	const task = loadTask(deps.cwd, taskId);
 	if (!task) throw new Error(`Task not found: ${taskId}`);
 
-	const { agent, invocation } = reviewerInvocation(deps.cwd, taskId, task.title);
+	const { agent, prompt, invocation } = reviewerInvocation(deps.cwd, taskId, task.title, reviewer);
 
 	const runId = createRunId(agent.cli);
 	const startedAt = new Date().toISOString();
 	const reviewPath = artifactPath(deps.cwd, "review", taskId, runId);
-	ensureRunDirs(reviewPath);
+	const verdictPath = reviewVerdictPath(deps.cwd, taskId, runId);
+	const live = tracePath(deps.cwd, taskId, runId);
+	ensureRunDirs(reviewPath, live, verdictPath);
+
+	const promptPath = writePromptSnapshot(deps.cwd, {
+		task_id: taskId,
+		phase: "review",
+		run_id: runId,
+		cli: agent.cli,
+		reviewer: reviewer ?? agent.reviewer ?? agent.cli,
+	}, prompt);
 
 	const result = await deps.invoke({
-		label: `Reviewing ${taskId}`,
+		label: `Reviewing ${taskId} with ${agent.cli}`,
 		command: invocation.command,
 		args: invocation.args,
+		stdin: invocation.stdin,
+		jsonStream: invocation.jsonStream,
+		liveLogPath: live,
 		timeoutMs: 30 * 60 * 1000,
 	});
 
@@ -191,34 +221,48 @@ export async function runReviewPhase(
 		throw new Error(result.stderr.trim() || `${agent.cli} review failed (exit ${result.code})`);
 	}
 
-	const passed = parseReviewVerdict(body);
+	const payload = extractReviewVerdictFromBody(body, taskId, runId);
+	if (payload) writeReviewVerdictJson(verdictPath, payload);
+
+	const passed = reviewPassed(body, payload);
 	const status = reviewStatusFromVerdict(passed);
 	const endedAt = new Date().toISOString();
 	const run: TaskRun = {
 		runId,
 		phase: "review",
-		worker: agent.cli === "codex" ? "codex" : undefined,
+		worker: agent.cli === "codex" || agent.cli === "claude" ? agent.cli : undefined,
 		startedAt,
 		endedAt,
 		exitCode: result.code,
-		paths: { output: reviewPath },
+		paths: { output: reviewPath, live, prompt: promptPath },
 	};
 
 	const updated = patchTaskStatus(deps, taskId, status, {
-		artifacts: { review: reviewPath },
+		artifacts: {
+			review: reviewPath,
+			reviewVerdict: payload ? verdictPath : undefined,
+			liveTrace: live,
+			reviewPrompt: promptPath,
+		},
 		timestamps: { ...task.timestamps, reviewed: endedAt },
 		run,
 	});
 
 	const verdict = formatReviewVerdict(passed);
+	const findingsLine = payload ? formatFindingsSummary(payload) : "";
 	const next = passed ? "" : execHintAfterReviewFail(taskId, task.worker);
 	const summary = [
 		`Review ${taskId}: ${verdict}`,
 		`Report: ${reviewPath}`,
+		payload ? `Verdict: ${verdictPath}` : "",
+		`Prompt: ${promptPath}`,
+		findingsLine,
 		next,
 		"",
 		body.slice(0, 2000) + (body.length > 2000 ? "\n…(truncated, see file)" : ""),
-	].join("\n");
+	]
+		.filter(Boolean)
+		.join("\n");
 
 	return { summary, task: updated, passed };
 }

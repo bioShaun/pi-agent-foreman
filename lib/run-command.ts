@@ -3,17 +3,23 @@ import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, matchesKey, Spacer, Text } from "@earendil-works/pi-tui";
 import { watchAntigravityProgress } from "./antigravity-progress.ts";
 import { shortenDisplayPath } from "./format-display.ts";
+import { buildThemedLoaderText } from "./loader-theme.ts";
 import { appendLiveLog, ensureLiveOutputSection, initLiveLog } from "./live-log.ts";
 import {
-	buildLoaderText,
 	isLoaderProgressLine,
 	loaderFallback,
 	pushDisplayLine,
 	usesStructuredProgress,
 } from "./run-display.ts";
 import { spawnProcess, type RunResult } from "./spawn-process.ts";
-import type { Worker } from "./types.ts";
-import { isWorker } from "./types.ts";
+import type { Reviewer, Worker } from "./types.ts";
+import { isReviewer, isWorker } from "./types.ts";
+
+function parseReviewer(raw: string, defaultReviewer: Reviewer): Reviewer {
+	const reviewer = raw.toLowerCase();
+	if (!isReviewer(reviewer)) throw new Error(`Unknown reviewer: ${reviewer}`);
+	return reviewer;
+}
 
 function parseWorker(raw: string, defaultWorker: Worker): Worker {
 	const worker = raw.toLowerCase();
@@ -80,7 +86,7 @@ export async function runWithLoader(
 		const fallback = loaderFallback(options);
 
 		const refresh = () => {
-			output.setText(theme.fg("muted", buildLoaderText(label, Date.now() - started, recentLines, fallback)));
+			output.setText(buildThemedLoaderText(theme, label, Date.now() - started, recentLines, fallback));
 			redraw();
 		};
 
@@ -181,8 +187,48 @@ export function parseSingleExecArgs(args: string, defaultWorker: Worker = "claud
 	return parsed;
 }
 
-export function parseReviewArgs(args: string): string {
-	const taskId = args.trim().match(/^(T\d+)/i)?.[1]?.toUpperCase();
-	if (!taskId) throw new Error("Usage: /agent review T001");
-	return taskId;
+export function parseReviewArgs(
+	args: string,
+	defaultReviewer: Reviewer = "codex",
+):
+	| { mode: "single"; taskId: string; reviewer: Reviewer }
+	| { mode: "batch"; reviewer: Reviewer; fromTaskId?: string; continueOnError: boolean } {
+	const trimmed = args.trim();
+	if (!trimmed) {
+		throw new Error(
+			"Usage: /agent review T001 [--reviewer claude|codex] | /agent review --all [--reviewer claude|codex] [--from T003] [--continue-on-error]",
+		);
+	}
+
+	const reviewerMatch = trimmed.match(/--reviewer\s+(\w+)/i);
+	const reviewer = parseReviewer(reviewerMatch?.[1]?.toLowerCase() ?? defaultReviewer, defaultReviewer);
+
+	if (/^--all\b/i.test(trimmed)) {
+		const fromMatch = trimmed.match(/--from\s+(T\d+)/i);
+		return {
+			mode: "batch",
+			reviewer,
+			fromTaskId: fromMatch?.[1]?.toUpperCase(),
+			continueOnError: /--continue-on-error\b/i.test(trimmed),
+		};
+	}
+
+	const taskId = trimmed.match(/^(T\d+)/i)?.[1]?.toUpperCase();
+	if (!taskId) {
+		throw new Error(
+			"Usage: /agent review T001 [--reviewer claude|codex] | /agent review --all [--reviewer claude|codex] [--from T003] [--continue-on-error]",
+		);
+	}
+	return { mode: "single", taskId, reviewer };
+}
+
+export function parseRunArgs(
+	args: string,
+	defaultWorker: Worker = "claude",
+	defaultReviewer: Reviewer = "codex",
+): { taskId: string; worker: Worker; reviewer: Reviewer } {
+	const { taskId, worker } = parseSingleExecArgs(args, defaultWorker);
+	const reviewerMatch = args.match(/--reviewer\s+(\w+)/i);
+	const reviewer = parseReviewer(reviewerMatch?.[1]?.toLowerCase() ?? defaultReviewer, defaultReviewer);
+	return { taskId, worker, reviewer };
 }

@@ -1,5 +1,5 @@
 import { loadManifest, loadPlan, loadTask } from "./agent-store.ts";
-import { isExecRunnable } from "./task-status.ts";
+import { isExecRunnable, isReviewRunnable } from "./task-status.ts";
 import type { AgentPlan, AgentTask } from "./types.ts";
 
 export function loadActivePlan(cwd: string): AgentPlan {
@@ -14,13 +14,17 @@ export function loadActivePlan(cwd: string): AgentPlan {
 	return plan;
 }
 
-export interface ExecBatchSelection {
+export interface BatchSelection {
 	plan: AgentPlan;
 	runnable: AgentTask[];
 	skipped: AgentTask[];
 }
 
-export function tasksForExecBatch(cwd: string, opts?: { fromTaskId?: string }): ExecBatchSelection {
+function tasksForBatch(
+	cwd: string,
+	isRunnable: (status: AgentTask["status"]) => boolean,
+	opts?: { fromTaskId?: string },
+): BatchSelection {
 	const plan = loadActivePlan(cwd);
 	let ids = [...plan.taskIds];
 	if (opts?.fromTaskId) {
@@ -36,8 +40,20 @@ export function tasksForExecBatch(cwd: string, opts?: { fromTaskId?: string }): 
 	for (const id of ids) {
 		const task = loadTask(cwd, id);
 		if (!task) continue;
-		if (isExecRunnable(task.status)) runnable.push(task);
+		if (isRunnable(task.status)) runnable.push(task);
 		else skipped.push(task);
 	}
 	return { plan, runnable, skipped };
+}
+
+export type ExecBatchSelection = BatchSelection;
+
+export function tasksForExecBatch(cwd: string, opts?: { fromTaskId?: string }): BatchSelection {
+	return tasksForBatch(cwd, isExecRunnable, opts);
+}
+
+export type ReviewBatchSelection = BatchSelection;
+
+export function tasksForReviewBatch(cwd: string, opts?: { fromTaskId?: string }): BatchSelection {
+	return tasksForBatch(cwd, isReviewRunnable, opts);
 }

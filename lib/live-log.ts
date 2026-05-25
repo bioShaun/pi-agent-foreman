@@ -1,5 +1,5 @@
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { appendFileSync, writeFileSync } from "node:fs";
+import { ensureRunDirs } from "./agent-paths.ts";
 
 export type LiveLogSection = "progress" | "output";
 
@@ -9,7 +9,7 @@ const MARKERS: Record<LiveLogSection, string> = {
 };
 
 export function initLiveLog(path: string, header: string): void {
-	mkdirSync(dirname(path), { recursive: true });
+	ensureRunDirs(path);
 	writeFileSync(path, `# ${header}\n\n${MARKERS.progress}\n`, "utf-8");
 }
 

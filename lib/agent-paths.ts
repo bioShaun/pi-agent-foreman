@@ -21,6 +21,14 @@ export function artifactPath(cwd: string, phase: RunPhase, entityId: string, run
 	return join(agentRoot(cwd), "artifacts", phase, entityId, `${runId}.${ext}`);
 }
 
+export function reviewVerdictPath(cwd: string, taskId: string, runId: string): string {
+	return join(agentRoot(cwd), "artifacts", "review", taskId, `${runId}.json`);
+}
+
+export function promptPath(cwd: string, phase: RunPhase, taskId: string, runId: string): string {
+	return join(agentRoot(cwd), "prompts", phase, taskId, `${runId}.md`);
+}
+
 export function tracePath(cwd: string, taskId: string, runId: string): string {
 	return join(agentRoot(cwd), "traces", taskId, `${runId}.live.log`);
 }

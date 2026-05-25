@@ -3,10 +3,14 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	formatFindingsForWorker,
+	renderReviewVerdictContract,
+	type ReviewContext,
+} from "./review-verdict.ts";
 import { buildRoleInvocation, type RoleInvocation } from "./role-invoke.ts";
-import { cliBinCandidates } from "./cli-resolve.ts";
 import { which } from "./run-command.ts";
-import type { Worker } from "./types.ts";
+import type { Reviewer, Worker } from "./types.ts";
 
 export type AgentRole = "planner" | "worker" | "reviewer";
 
@@ -17,6 +21,7 @@ export interface RoleAgent {
 	/** Executable on PATH; defaults from cli (e.g. antigravity → agy). */
 	bin?: string;
 	worker?: Worker;
+	reviewer?: Reviewer;
 	description: string;
 	systemPrompt: string;
 	source: "package" | "project";
@@ -51,6 +56,7 @@ function loadAgentsFromDir(dir: string, source: "package" | "project"): RoleAgen
 			cli: frontmatter.cli,
 			bin: frontmatter.bin,
 			worker: frontmatter.worker as Worker | undefined,
+			reviewer: frontmatter.reviewer as Reviewer | undefined,
 			description: frontmatter.description ?? "",
 			systemPrompt: body.trim(),
 			source,
@@ -79,10 +85,12 @@ export function discoverRoleAgents(cwd: string): RoleAgent[] {
 }
 
 function agentKey(agent: RoleAgent): string {
-	return agent.role === "worker" ? `worker:${agent.worker ?? agent.cli}` : agent.role;
+	if (agent.role === "worker") return `worker:${agent.worker ?? agent.cli}`;
+	if (agent.role === "reviewer") return `reviewer:${agent.reviewer ?? agent.cli}`;
+	return agent.role;
 }
 
-export function getAgent(cwd: string, role: AgentRole, worker?: Worker): RoleAgent {
+export function getAgent(cwd: string, role: AgentRole, worker?: Worker, reviewer?: Reviewer): RoleAgent {
 	const agents = discoverRoleAgents(cwd);
 	if (role === "worker") {
 		const match =
@@ -90,6 +98,19 @@ export function getAgent(cwd: string, role: AgentRole, worker?: Worker): RoleAge
 			agents.find((a) => a.role === "worker" && a.cli === worker) ??
 			agents.find((a) => a.role === "worker");
 		if (!match) throw new Error(`No worker agent for ${worker ?? "default"}. Add agents/worker-*.md`);
+		return match;
+	}
+	if (role === "reviewer") {
+		const match =
+			(reviewer &&
+				agents.find(
+					(a) => a.role === "reviewer" && (a.reviewer === reviewer || a.cli === reviewer),
+				)) ??
+			agents.find((a) => a.role === "reviewer" && (a.reviewer === "codex" || a.cli === "codex")) ??
+			agents.find((a) => a.role === "reviewer");
+		if (!match) {
+			throw new Error(`No reviewer agent for ${reviewer ?? "default"}. Add agents/reviewer*.md`);
+		}
 		return match;
 	}
 	const match = agents.find((a) => a.role === role);
@@ -104,26 +125,23 @@ export function buildPlannerPrompt(agent: RoleAgent, goal: string): string {
 export function buildWorkerPrompt(
 	agent: RoleAgent,
 	taskPrompt: string,
-	reviewFeedback?: string,
+	review?: ReviewContext,
 ): string {
 	let prompt = `${agent.systemPrompt}\n\n---\n\n## Task\n\n${taskPrompt}`;
-	if (reviewFeedback?.trim()) {
-		prompt += `\n\n---\n\n## Previous review feedback\n\n${reviewFeedback.trim()}\n\nAddress the feedback and complete the task.`;
+	if (review) {
+		const block = review.payload
+			? formatFindingsForWorker(review.payload)
+			: review.rawReview?.trim();
+		if (block) {
+			const suffix = review.payload ? "" : "\n\nAddress the review feedback and complete the task.";
+			prompt += `\n\n---\n\n${block}${suffix}`;
+		}
 	}
 	return prompt;
 }
 
 export function buildReviewerPrompt(agent: RoleAgent, taskId: string, title: string): string {
-	return `${agent.systemPrompt}\n\n---\n\nTask ${taskId}: ${title}`;
-}
-
-export function readReviewFeedback(reviewPath: string | undefined): string | undefined {
-	if (!reviewPath || !existsSync(reviewPath)) return undefined;
-	try {
-		return readFileSync(reviewPath, "utf-8");
-	} catch {
-		return undefined;
-	}
+	return `${agent.systemPrompt}\n\n---\n\nTask ${taskId}: ${title}\n\nInspect **uncommitted git changes** in this repository (\`git diff\`, \`git diff --staged\`, and read files as needed). Focus on whether the changes satisfy this task.${renderReviewVerdictContract(taskId)}`;
 }
 
 export async function assertRoleAgentAvailable(
@@ -131,8 +149,9 @@ export async function assertRoleAgentAvailable(
 	cwd: string,
 	role: AgentRole,
 	worker?: Worker,
+	reviewer?: Reviewer,
 ): Promise<RoleAgent> {
-	const agent = getAgent(cwd, role, worker);
+	const agent = getAgent(cwd, role, worker, reviewer);
 	const candidates = cliBinCandidates(agent.cli, agent.bin);
 	for (const bin of candidates) {
 		if (await which(pi, cwd, bin)) return agent;
@@ -152,24 +171,25 @@ export function workerInvocation(
 	cwd: string,
 	worker: Worker,
 	taskPrompt: string,
-	reviewFeedback?: string,
-): { agent: RoleAgent; invocation: RoleInvocation } {
+	review?: ReviewContext,
+): { agent: RoleAgent; prompt: string; invocation: RoleInvocation } {
 	const agent = getAgent(cwd, "worker", worker);
-	const prompt = buildWorkerPrompt(agent, taskPrompt, reviewFeedback);
-	return { agent, invocation: buildRoleInvocation(agent, { mode: "prompt", prompt }) };
+	const prompt = buildWorkerPrompt(agent, taskPrompt, review);
+	return { agent, prompt, invocation: buildRoleInvocation(agent, { mode: "prompt", prompt }) };
 }
 
 export function reviewerInvocation(
 	cwd: string,
 	taskId: string,
 	title: string,
-): { agent: RoleAgent; invocation: RoleInvocation } {
-	const agent = getAgent(cwd, "reviewer");
-	const criteria = buildReviewerPrompt(agent, taskId, title).replace(/\s+/g, " ").slice(0, 400);
-	const reviewTitle = `${taskId}: ${title} — ${criteria}`;
+	reviewer?: Reviewer,
+): { agent: RoleAgent; prompt: string; invocation: RoleInvocation } {
+	const agent = getAgent(cwd, "reviewer", undefined, reviewer);
+	const prompt = buildReviewerPrompt(agent, taskId, title);
 	return {
 		agent,
-		invocation: buildRoleInvocation(agent, { mode: "review-title", title: reviewTitle }),
+		prompt,
+		invocation: buildRoleInvocation(agent, { mode: "review", prompt }),
 	};
 }
 

@@ -1,9 +1,13 @@
 const MAX_RECENT = 80;
 const TAIL_LINES = 12;
 
-function tail(text: string, lines = TAIL_LINES): string {
+function tail(text: string, lines: number): string {
 	const parts = text.trim().split("\n");
 	return parts.slice(-lines).join("\n");
+}
+
+export function tailLines(text: string, lines = 8): string {
+	return tail(text, lines);
 }
 
 export function formatElapsed(ms: number): string {
@@ -14,11 +18,6 @@ export function formatElapsed(ms: number): string {
 
 export function buildLoaderBody(recentLines: string[], fallback: string): string {
 	return recentLines.length > 0 ? tail(recentLines.join("\n"), TAIL_LINES) : fallback;
-}
-
-export function buildLoaderText(label: string, elapsedMs: number, recentLines: string[], fallback: string): string {
-	const header = `${label}  (${formatElapsed(elapsedMs)})`;
-	return `${header}\n${buildLoaderBody(recentLines, fallback)}`;
 }
 
 export interface LoaderOptions {
