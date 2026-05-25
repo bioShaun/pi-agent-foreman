@@ -11,7 +11,7 @@ import {
 import { buildRoleInvocation, type RoleInvocation } from "./role-invoke.ts";
 import { cliBinCandidates } from "./cli-resolve.ts";
 import { which } from "./run-command.ts";
-import type { Reviewer, Worker } from "./types.ts";
+import type { Reviewer, ReviewVerdictPayload, Worker } from "./types.ts";
 
 export type AgentRole = "planner" | "worker" | "reviewer";
 
@@ -145,6 +145,31 @@ export function buildReviewerPrompt(agent: RoleAgent, taskId: string, title: str
 	return `${agent.systemPrompt}\n\n---\n\nTask ${taskId}: ${title}\n\nInspect **uncommitted git changes** in this repository (\`git diff\`, \`git diff --staged\`, and read files as needed). Focus on whether the changes satisfy this task.${renderReviewVerdictContract(taskId)}`;
 }
 
+export function buildReviewerFixPrompt(
+	agent: RoleAgent,
+	taskId: string,
+	title: string,
+	payload: ReviewVerdictPayload,
+): string {
+	return [
+		agent.systemPrompt,
+		"",
+		"---",
+		"",
+		`## Review-fix for ${taskId}: ${title}`,
+		"",
+		"Fix the review findings below in the **working tree** (uncommitted changes).",
+		"",
+		"Rules:",
+		"- Stay within this task's scope — do not refactor unrelated code",
+		"- Run `ruff check` / `pytest` on touched paths when the project has them",
+		"- **Never** delete, move, or `git stash -u` the `.agent/` directory",
+		"- Summarize what you changed when done",
+		"",
+		formatFindingsForWorker(payload),
+	].join("\n");
+}
+
 export async function assertRoleAgentAvailable(
 	pi: ExtensionAPI,
 	cwd: string,
@@ -191,6 +216,22 @@ export function reviewerInvocation(
 		agent,
 		prompt,
 		invocation: buildRoleInvocation(agent, { mode: "review", prompt }),
+	};
+}
+
+export function reviewerFixInvocation(
+	cwd: string,
+	taskId: string,
+	title: string,
+	reviewer: Reviewer | undefined,
+	payload: ReviewVerdictPayload,
+): { agent: RoleAgent; prompt: string; invocation: RoleInvocation } {
+	const agent = getAgent(cwd, "reviewer", undefined, reviewer);
+	const prompt = buildReviewerFixPrompt(agent, taskId, title, payload);
+	return {
+		agent,
+		prompt,
+		invocation: buildRoleInvocation(agent, { mode: "prompt", prompt }),
 	};
 }
 

@@ -5,8 +5,16 @@ export function isExecRunnable(status: TaskStatus): boolean {
 	return status === "pending" || status === "review_fail" || status === "running";
 }
 
-export function isReviewRunnable(status: TaskStatus): boolean {
-	return status === "done";
+export function isReviewRunnable(status: TaskStatus, opts?: { fix?: boolean }): boolean {
+	if (status === "done") return true;
+	if (opts?.fix && status === "review_fail") return true;
+	return false;
+}
+
+const MARK_PASS_ELIGIBLE: ReadonlySet<TaskStatus> = new Set(["done", "review_fail", "running"]);
+
+export function isMarkPassEligible(status: TaskStatus): boolean {
+	return MARK_PASS_ELIGIBLE.has(status);
 }
 
 export function reviewStatusFromVerdict(passed: boolean): "review_pass" | "review_fail" {

@@ -104,6 +104,12 @@ export function setActivePlan(cwd: string, planId: string): void {
 	saveManifest(cwd, manifest);
 }
 
+export function clearActivePlan(cwd: string): void {
+	const manifest = loadManifest(cwd);
+	manifest.activePlanId = null;
+	saveManifest(cwd, manifest);
+}
+
 export function loadBoulder(cwd: string): AgentBoulder | null {
 	const path = join(agentRoot(cwd), "boulder.json");
 	if (!existsSync(path)) return null;

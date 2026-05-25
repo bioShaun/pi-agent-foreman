@@ -17,7 +17,7 @@ export function createRunId(provider: string): string {
 }
 
 export function artifactPath(cwd: string, phase: RunPhase, entityId: string, runId: string): string {
-	const ext = phase === "exec" ? "log" : "md";
+	const ext = phase === "exec" || phase === "review_fix" ? "log" : "md";
 	return join(agentRoot(cwd), "artifacts", phase, entityId, `${runId}.${ext}`);
 }
 

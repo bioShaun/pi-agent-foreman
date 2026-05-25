@@ -1,6 +1,6 @@
 import { loadManifest, loadPlan, loadTask } from "./agent-store.ts";
 import { areExecDepsMet } from "./task-deps.ts";
-import { isExecRunnable, isReviewRunnable } from "./task-status.ts";
+import { isExecRunnable, isMarkPassEligible, isReviewRunnable } from "./task-status.ts";
 import type { AgentPlan, AgentTask } from "./types.ts";
 
 export function loadActivePlan(cwd: string): AgentPlan {
@@ -65,6 +65,13 @@ export function tasksForExecBatch(cwd: string, opts?: { fromTaskId?: string }): 
 
 export type ReviewBatchSelection = BatchSelection;
 
-export function tasksForReviewBatch(cwd: string, opts?: { fromTaskId?: string }): BatchSelection {
-	return tasksForBatch(cwd, isReviewRunnable, opts);
+export function tasksForReviewBatch(
+	cwd: string,
+	opts?: { fromTaskId?: string; fix?: boolean },
+): BatchSelection {
+	return tasksForBatch(cwd, (status) => isReviewRunnable(status, { fix: opts?.fix }), opts);
+}
+
+export function tasksForMarkPassBatch(cwd: string, opts?: { fromTaskId?: string }): BatchSelection {
+	return tasksForBatch(cwd, isMarkPassEligible, opts);
 }

@@ -10,7 +10,9 @@ import {
 } from "./run-command.ts";
 import { artifactPath, createRunId, ensureRunDirs } from "./agent-paths.ts";
 import {
+	clearActivePlan,
 	createPlanFromParsed,
+	loadManifest,
 	listTasks,
 	loadBoulder,
 	loadTask,
@@ -21,12 +23,19 @@ import { formatBoulderStatus, parseResumeArgs, resolveBoulderResume } from "./bo
 import { formatTaskList, formatTaskLogs } from "./format-tasks.ts";
 import { tasksForExecBatch, tasksForReviewBatch } from "./task-queries.ts";
 import { areExecDepsMet } from "./task-deps.ts";
+import { runReviewWithFixLoop } from "./review-fix-loop.ts";
 import { makeTaskRunDeps, runExecPhase, runReviewPhase } from "./task-run.ts";
-import { refreshTaskWidget } from "./task-widget.ts";
+import { withParallelBatchDisplay, type ParallelExecListener } from "./parallel-batch-ui.ts";
+import { markTaskReviewPass, parseMarkPassArgs, tasksForMarkPassBatch } from "./mark-pass.ts";
+import { isActivePlanComplete, refreshTaskWidget } from "./task-widget.ts";
 import { isExecRunnable, isRunComplete, isRunStillFailing } from "./task-status.ts";
 import type { Reviewer, Worker } from "./types.ts";
 
-function foremanTaskDeps(pi: ExtensionAPI, ctx: ExtensionCommandContext, opts?: { silent?: boolean }) {
+function foremanTaskDeps(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	opts?: { silent?: boolean; onExecStarted?: ParallelExecListener["onStarted"] },
+) {
 	return makeTaskRunDeps(pi, ctx, () => refreshTaskWidget(ctx), opts);
 }
 
@@ -150,7 +159,7 @@ async function runExecAll(
 		sections.push(`Skipped: ${selection.skipped.map((t) => `${t.id}[${t.status}]`).join(", ")}`);
 	}
 	if (opts.parallel > 1) {
-		sections.push("Parallel mode: no TUI loader — tail `.agent/traces/T00N/*.live.log` per task");
+		sections.push("Parallel mode: multi-task progress panel · tail `.agent/traces/T00N/*.live.log` for full detail");
 	}
 
 	let succeeded = 0;
@@ -193,67 +202,89 @@ async function runExecAll(
 		return sections.join("\n\n");
 	};
 
-	while (pending.size > 0) {
-		const ready = [...pending].filter((id) => {
-			const task = loadTask(ctx.cwd, id);
-			return task && isExecRunnable(task.status) && areExecDepsMet(task, ctx.cwd);
-		});
+	const runBatch = async (listener: ParallelExecListener): Promise<string> => {
+		while (pending.size > 0) {
+			const ready = [...pending].filter((id) => {
+				const task = loadTask(ctx.cwd, id);
+				return task && isExecRunnable(task.status) && areExecDepsMet(task, ctx.cwd);
+			});
 
-		if (ready.length === 0) break;
+			if (ready.length === 0) break;
 
-		const chunk = ready.slice(0, opts.parallel);
-		const batchDeps = foremanTaskDeps(pi, ctx, { silent: opts.parallel > 1 });
+			const chunk = ready.slice(0, opts.parallel);
+			const batchDeps = foremanTaskDeps(pi, ctx, {
+				silent: opts.parallel > 1,
+				onExecStarted: listener.onStarted,
+			});
 
-		const runOne = async (taskId: string) => {
-			updateBoulderProgress(ctx.cwd, { current_task_id: taskId });
-			try {
-				const summary = await execTask(pi, ctx, taskId, opts.worker, batchDeps);
-				return { taskId, ok: true as const, summary };
-			} catch (err) {
-				const message = err instanceof Error ? err.message : String(err);
-				return { taskId, ok: false as const, message };
-			}
-		};
+			const runOne = async (taskId: string) => {
+				updateBoulderProgress(ctx.cwd, { current_task_id: taskId });
+				try {
+					const summary = await execTask(pi, ctx, taskId, opts.worker, batchDeps);
+					return { taskId, ok: true as const, summary };
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					return { taskId, ok: false as const, message };
+				} finally {
+					listener.onFinished?.(taskId);
+				}
+			};
 
-		const outcomes = await Promise.all(chunk.map(runOne));
-		for (const outcome of outcomes) {
-			pending.delete(outcome.taskId);
-			if (outcome.ok) {
-				sections.push(`### ${outcome.taskId}`, outcome.summary);
-				succeeded++;
-			} else {
-				recordFailure(outcome.taskId, outcome.message);
-				if (!opts.continueOnError) {
-					return stopBatchEarly(outcome.taskId);
+			const outcomes = await Promise.all(chunk.map(runOne));
+			for (const outcome of outcomes) {
+				pending.delete(outcome.taskId);
+				if (outcome.ok) {
+					sections.push(`### ${outcome.taskId}`, outcome.summary);
+					succeeded++;
+				} else {
+					recordFailure(outcome.taskId, outcome.message);
+					if (!opts.continueOnError) {
+						return stopBatchEarly(outcome.taskId);
+					}
 				}
 			}
 		}
-	}
 
-	if (pending.size > 0) {
-		sections.push(`Still blocked (deps): ${[...pending].join(", ")}`);
-	}
+		if (pending.size > 0) {
+			sections.push(`Still blocked (deps): ${[...pending].join(", ")}`);
+		}
 
-	if (boulder && failed === 0) {
-		const latest = loadBoulder(ctx.cwd)!;
-		saveBoulder(ctx.cwd, {
-			...latest,
-			batch: {
-				mode: "exec",
+		if (boulder && failed === 0) {
+			const latest = loadBoulder(ctx.cwd)!;
+			saveBoulder(ctx.cwd, {
+				...latest,
+				batch: {
+					mode: "exec",
+					worker: opts.worker,
+					started_at: batchStartedAt,
+					stopped_at: new Date().toISOString(),
+				},
+			});
+		}
+
+		sections.push("", `Batch complete: ${succeeded} succeeded${failed > 0 ? `, ${failed} failed` : ""}.`);
+		if (failures.length > 0) {
+			sections.push(`Failures:\n${failures.map((f) => `- ${f}`).join("\n")}`);
+		}
+		sections.push("", "Next: /agent review --all  (review stays serial; or /agent review T00N)");
+
+		return sections.join("\n\n");
+	};
+
+	if (opts.parallel > 1 && ctx.hasUI) {
+		return withParallelBatchDisplay(
+			ctx,
+			{
+				planId: selection.plan.id,
 				worker: opts.worker,
-				started_at: batchStartedAt,
-				stopped_at: new Date().toISOString(),
+				parallel: opts.parallel,
+				pool: [...pending],
 			},
-		});
+			runBatch,
+		);
 	}
 
-	sections.push("", `Batch complete: ${succeeded} succeeded${failed > 0 ? `, ${failed} failed` : ""}.`);
-	if (failures.length > 0) {
-		sections.push(`Failures:\n${failures.map((f) => `- ${f}`).join("\n")}`);
-	}
-	sections.push("", "Next: /agent review --all  (review stays serial; or /agent review T00N)");
-
-	return sections.join("\n\n");
+	return runBatch({});
 }
 
 async function reviewTask(
@@ -261,9 +292,14 @@ async function reviewTask(
 	ctx: ExtensionCommandContext,
 	taskId: string,
 	reviewer: Reviewer = "codex",
+	fix = false,
 ): Promise<string> {
 	await assertRoleAgentAvailable(pi, ctx.cwd, "reviewer", undefined, reviewer);
 	const deps = foremanTaskDeps(pi, ctx);
+	if (fix) {
+		const { summary } = await runReviewWithFixLoop(deps, pi, taskId, reviewer);
+		return summary;
+	}
 	const { summary } = await runReviewPhase(deps, taskId, reviewer);
 	return summary;
 }
@@ -271,16 +307,20 @@ async function reviewTask(
 async function runReviewAll(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
-	opts: { reviewer: Reviewer; fromTaskId?: string; continueOnError: boolean },
+	opts: { reviewer: Reviewer; fromTaskId?: string; continueOnError: boolean; fix: boolean },
 ): Promise<string> {
-	const { plan, runnable, skipped } = tasksForReviewBatch(ctx.cwd, { fromTaskId: opts.fromTaskId });
+	const { plan, runnable, skipped } = tasksForReviewBatch(ctx.cwd, {
+		fromTaskId: opts.fromTaskId,
+		fix: opts.fix,
+	});
 
 	if (runnable.length === 0) {
 		const skippedSummary =
 			skipped.length > 0
 				? `\nSkipped (${skipped.length}): ${skipped.map((t) => `${t.id}[${t.status}]`).join(", ")}`
 				: "";
-		return `No reviewable tasks in ${plan.id} (done only).${skippedSummary}\n\nNext: /agent list`;
+		const eligibility = opts.fix ? "done or review_fail" : "done only";
+		return `No reviewable tasks in ${plan.id} (${eligibility}).${skippedSummary}\n\nNext: /agent list`;
 	}
 
 	await assertRoleAgentAvailable(pi, ctx.cwd, "reviewer", undefined, opts.reviewer);
@@ -289,6 +329,9 @@ async function runReviewAll(
 		`## Review batch — ${plan.id}`,
 		`Reviewer: ${opts.reviewer} · Reviewable: ${runnable.map((t) => t.id).join(", ")}`,
 	];
+	if (opts.fix) {
+		sections.push("Mode: --fix (lint → ruff+gate; minor → review-fix + 1 re-review; major → stop)");
+	}
 	if (opts.fromTaskId) sections.push(`From: ${opts.fromTaskId}`);
 	if (skipped.length > 0) {
 		sections.push(`Skipped: ${skipped.map((t) => `${t.id}[${t.status}]`).join(", ")}`);
@@ -302,7 +345,10 @@ async function runReviewAll(
 
 	for (const task of runnable) {
 		try {
-			const { summary, passed: ok } = await runReviewPhase(batchDeps, task.id, opts.reviewer);
+			const result = opts.fix
+				? await runReviewWithFixLoop(batchDeps, pi, task.id, opts.reviewer)
+				: await runReviewPhase(batchDeps, task.id, opts.reviewer);
+			const { summary, passed: ok } = result;
 			sections.push(`### ${task.id}`, summary);
 			if (ok) passed++;
 			else {
@@ -352,7 +398,79 @@ export async function runReview(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
 	if (parsed.mode === "batch") {
 		return runReviewAll(pi, ctx, parsed);
 	}
-	return reviewTask(pi, ctx, parsed.taskId, parsed.reviewer);
+	return reviewTask(pi, ctx, parsed.taskId, parsed.reviewer, parsed.fix);
+}
+
+export function runClear(ctx: ExtensionCommandContext): string {
+	const manifest = loadManifest(ctx.cwd);
+	const planId = manifest.activePlanId;
+	const wasComplete = planId ? isActivePlanComplete(ctx.cwd) : false;
+	clearActivePlan(ctx.cwd);
+	refreshTaskWidget(ctx);
+	if (!planId) {
+		return "No active plan. Sidebar refreshed.";
+	}
+	if (wasComplete) {
+		return `Cleared active plan ${planId}. Plan complete — sidebar hidden.\n\nStart fresh: /agent plan <goal>`;
+	}
+	return `Cleared active plan ${planId}.\n\nSidebar shows all tasks (no plan filter). /agent list · new plan: /agent plan <goal>`;
+}
+
+export function runMarkPass(ctx: ExtensionCommandContext, args: string): string {
+	const parsed = parseMarkPassArgs(args);
+	if (parsed.mode === "single") {
+		const prior = loadTask(ctx.cwd, parsed.taskId);
+		if (prior?.status === "review_pass") {
+			return `${parsed.taskId} already review_pass (unchanged)`;
+		}
+		const updated = markTaskReviewPass(ctx.cwd, parsed.taskId);
+		refreshTaskWidget(ctx);
+		const lines = [
+			`## Mark pass — ${parsed.taskId}`,
+			"",
+			`${parsed.taskId} → review_pass (manual)`,
+			`Reviewed: ${updated.timestamps.reviewed}`,
+		];
+		if (isActivePlanComplete(ctx.cwd)) {
+			lines.push("", "All tasks in active plan are review_pass — sidebar hidden.", "Dismiss: /agent clear");
+		}
+		return lines.join("\n");
+	}
+
+	const { plan, runnable, skipped } = tasksForMarkPassBatch(ctx.cwd, {
+		fromTaskId: parsed.fromTaskId,
+	});
+	if (runnable.length === 0) {
+		const skippedSummary =
+			skipped.length > 0
+				? `\nSkipped (${skipped.length}): ${skipped.map((t) => `${t.id}[${t.status}]`).join(", ")}`
+				: "";
+		return `No markable tasks in ${plan.id} (done / review_fail / running only).${skippedSummary}\n\nNext: /agent list`;
+	}
+
+	const sections: string[] = [
+		`## Mark pass — ${plan.id}`,
+		`Manual finish · Markable: ${runnable.map((t) => t.id).join(", ")}`,
+	];
+	if (parsed.fromTaskId) sections.push(`From: ${parsed.fromTaskId}`);
+	if (skipped.length > 0) {
+		sections.push(`Skipped: ${skipped.map((t) => `${t.id}[${t.status}]`).join(", ")}`);
+	}
+
+	let marked = 0;
+	for (const task of runnable) {
+		markTaskReviewPass(ctx.cwd, task.id);
+		sections.push(`- ${task.id}: review_pass ✓`);
+		marked++;
+	}
+
+	refreshTaskWidget(ctx);
+	sections.push("", `Batch complete: ${marked} task(s) marked review_pass.`);
+	if (isActivePlanComplete(ctx.cwd)) {
+		sections.push("", "All tasks in active plan are review_pass — sidebar hidden.");
+		sections.push("Dismiss plan pointer: /agent clear");
+	}
+	return sections.join("\n");
 }
 
 export async function runTask(
@@ -453,9 +571,12 @@ export async function dispatchAgentCommand(
 			"                                     [--parallel N] [--from T003] [--continue-on-error]",
 			"/agent resume                        Resume last stopped exec batch (boulder.json)",
 			"                                     [--continue-on-error] · resume status",
-			"/agent review T001 [--reviewer claude|codex]",
-			"/agent review --all [--reviewer claude|codex]",
+			"/agent review T001 [--reviewer claude|codex] [--fix]",
+			"/agent review --all [--reviewer claude|codex] [--fix]",
 			"                                     [--from T003] [--continue-on-error]",
+			"/agent mark_pass T001                Manual finish → review_pass",
+			"/agent mark_pass --all [--from T003] Mark done/review_fail tasks pass",
+			"/agent clear                         Clear active plan · hide sidebar when done",
 			"/agent logs T001                     Run history + artifact paths",
 			"/agent list                          Show tasks",
 			"",
@@ -476,6 +597,11 @@ export async function dispatchAgentCommand(
 			return runExec(pi, ctx, rest);
 		case "review":
 			return runReview(pi, ctx, rest);
+		case "mark_pass":
+		case "mark-pass":
+			return runMarkPass(ctx, rest);
+		case "clear":
+			return runClear(ctx);
 		case "resume":
 			return runResume(pi, ctx, rest);
 		case "list":

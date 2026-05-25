@@ -41,7 +41,7 @@ We studied [oh-my-claudecode](https://github.com/bioShaun/oh-my-claudecode) (OMC
 - Flag: `/agent exec --all [--parallel N]` where `N` defaults to `1`, max `8`.
 - Scheduler: dynamic waves — repeatedly pick all pending tasks that are exec-runnable **and** deps-satisfied, run up to `N` concurrently, repeat until none ready or batch stops on error.
 - `N = 1`: current behaviour (TUI loader per task, sequential).
-- `N > 1`: **silent invoke** (no loader); each task writes its own `.agent/traces/…live.log`; batch summary lists paths. User can `tail -f` traces in separate terminals.
+- `N > 1`: **silent invoke** per task (no per-task loader); **`withParallelBatchDisplay`** shows a batch progress panel with active task IDs, `tail -f` hints, and live log tails refreshed every ~800ms. Full batch summary appears when the panel closes.
 - `--continue-on-error` and boulder resume behave as today; resume does not yet persist `parallel` (defaults to 1).
 
 ### 3. Review stays serial
@@ -69,7 +69,7 @@ We studied [oh-my-claudecode](https://github.com/bioShaun/oh-my-claudecode) (OMC
 **Negative / risks**
 
 - Parallel exec on one git tree: tasks touching the same files may conflict — user must set `depends_on` or accept manual resolution.
-- No loader during `--parallel > 1`; progress is via live trace files only.
+- Batch progress panel during `--parallel > 1` (when TUI available); per-task detail still in `.agent/traces/…live.log`.
 - Existing plans without `depends_on` behave as today (all runnable tasks appear independent).
 
 ## Phase 2 deliverables (this implementation)

@@ -1,11 +1,7 @@
 /**
  * Agent Foreman — Pi extension for multi-CLI orchestration.
  *
- * TUI commands:
- *   /agent plan <goal>
- *   /agent exec T001 [--worker claude|codex|antigravity]
- *   /agent run T001 [--worker claude]
- *   /agent list
+ * TUI: /agent plan | exec | run | review [--fix] | mark_pass | clear | resume | list | logs
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -13,7 +9,20 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { dispatchAgentCommand } from "./lib/commands.ts";
 import { refreshTaskWidget } from "./lib/task-widget.ts";
 
-const SUBCOMMANDS = ["plan", "run", "exec", "review", "resume", "list", "logs", "status", "tasks", "help"];
+const SUBCOMMANDS = [
+	"plan",
+	"run",
+	"exec",
+	"review",
+	"mark_pass",
+	"clear",
+	"resume",
+	"list",
+	"logs",
+	"status",
+	"tasks",
+	"help",
+];
 
 function agentNotifySummary(summary: string): string {
 	const batchStopped = summary.match(/Batch stopped at T\d+[^\n]*/);

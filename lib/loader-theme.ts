@@ -73,21 +73,15 @@ function formatShellCommand(theme: LoaderTheme, args: string): string {
 	return theme.fg("bashMode", args);
 }
 
-function formatProgressViewLine(theme: LoaderTheme, line: ProgressViewLine, selected = false): string {
-	if (line.isFoldChild) {
-		const failed = line.raw.endsWith(" (failed)");
-		const body = failed ? line.raw.slice(0, -" (failed)".length) : line.raw;
-		return (
-			theme.fg("dim", "  ") +
-			theme.fg("syntaxPunctuation", "· ") +
-			formatShellCommand(theme, body.slice(4)) +
-			(failed ? theme.fg("error", " (failed)") : "")
-		);
+function formatProgressViewLine(theme: LoaderTheme, line: ProgressViewLine): string {
+	if (line.isFoldToggle) {
+		const marker = line.foldExpanded ? "▾" : "▸";
+		return theme.fg("accent", marker) + theme.fg("dim", " ") + formatProgressLine(theme, line.raw);
 	}
-	return formatProgressLine(theme, line.raw, selected && line.isFoldHeader);
+	return formatProgressLine(theme, line.raw);
 }
 
-function formatProgressLine(theme: LoaderTheme, line: string, selected = false): string {
+function formatProgressLine(theme: LoaderTheme, line: string): string {
 	const failed = line.endsWith(" (failed)");
 	const body = failed ? line.slice(0, -" (failed)".length) : line;
 
@@ -96,30 +90,11 @@ function formatProgressLine(theme: LoaderTheme, line: string, selected = false):
 	if (/^(Starting |Working|Authenticated)/.test(body)) return theme.fg("dim", body);
 	if (body === "$ running command…") return theme.fg("dim", body);
 
-	if (body.startsWith("  · ")) {
-		return formatProgressViewLine(theme, { raw: body, isFoldChild: true });
-	}
-
 	if (!body.startsWith("$ ")) {
 		return theme.fg("muted", body);
 	}
 
 	const rest = body.slice(2);
-	const folded = rest.match(/^([\w-]+)\s+×\s+(\d+)\s+([▸▾])\s*(.*)$/);
-	if (folded) {
-		const marker = folded[3]!;
-		let out =
-			theme.fg("syntaxPunctuation", "$ ") +
-			theme.fg("toolTitle", theme.bold(folded[1]!)) +
-			theme.fg("dim", ` × ${folded[2]}`) +
-			theme.fg("syntaxPunctuation", ` ${marker} `);
-		const tail = folded[4] ?? "";
-		if (tail) out += formatShellCommand(theme, tail.replace(/ \(failed\)$/, ""));
-		if (tail.endsWith(" (failed)")) out += theme.fg("error", " (failed)");
-		if (selected) out = theme.fg("accent", "› ") + out;
-		return out;
-	}
-
 	const verbMatch = rest.match(/^(\w+)\s*(.*)$/);
 	if (!verbMatch) {
 		return theme.fg("syntaxPunctuation", "$ ") + theme.fg("muted", rest);
@@ -210,7 +185,7 @@ export function buildThemedLoaderPinned(
 	return `${header}\n\n${context}`;
 }
 
-export type LoaderProgressState = ProgressViewOptions & { selectedFoldId?: string };
+export type LoaderProgressState = ProgressViewOptions;
 
 export function buildThemedLoaderProgress(
 	theme: LoaderTheme,
@@ -225,9 +200,7 @@ export function buildThemedLoaderProgress(
 		buildProgressViewLines(recentLines, {
 			expandedFoldIds: state?.expandedFoldIds ?? new Set(),
 		});
-	return lines
-		.map((line) => formatProgressViewLine(theme, line, line.foldId === state?.selectedFoldId))
-		.join("\n");
+	return lines.map((line) => formatProgressViewLine(theme, line)).join("\n");
 }
 
 export function buildThemedLoaderText(

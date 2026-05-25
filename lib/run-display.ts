@@ -41,7 +41,6 @@ export function foldProgressKey(line: string): string | null {
 
 interface ProgressFoldGroup {
 	id: string;
-	key: string;
 	lines: string[];
 }
 
@@ -49,10 +48,15 @@ export type ProgressEntry = { kind: "line"; line: string } | { kind: "fold"; fol
 
 export interface ProgressViewLine {
 	raw: string;
+	/** Fold group id (toggle row only). */
 	foldId?: string;
-	isFoldHeader?: boolean;
-	isFoldChild?: boolean;
+	/** Row shows ▸/▾; only this cell toggles expand/collapse. */
+	isFoldToggle?: boolean;
+	foldExpanded?: boolean;
 }
+
+/** Terminal columns reserved for the fold arrow (▸/▾ + space). */
+export const FOLD_ARROW_HIT_COLS = 2;
 
 export interface ProgressViewOptions {
 	expandedFoldIds: ReadonlySet<string>;
@@ -82,20 +86,11 @@ function buildProgressEntries(lines: string[]): ProgressEntry[] {
 		} else {
 			out.push({
 				kind: "fold",
-				fold: { id: `${key}@${startIdx}`, key, lines: groupLines },
+				fold: { id: `${key}@${startIdx}`, lines: groupLines },
 			});
 		}
 	}
 	return out;
-}
-
-function formatFoldHeader(fold: ProgressFoldGroup, expanded: boolean): string {
-	const latest = fold.lines[fold.lines.length - 1]!;
-	const failed = latest.endsWith(" (failed)");
-	const body = latest.slice(2).replace(/ \(failed\)$/, "");
-	const detail = summarizeShellCommand(body);
-	const marker = expanded ? "▾" : "▸";
-	return `$ ${fold.key} × ${fold.lines.length}  ${marker} ${detail}${failed ? " (failed)" : ""}`;
 }
 
 function flattenProgressEntries(entries: ProgressEntry[], expandedFoldIds: ReadonlySet<string>): ProgressViewLine[] {
@@ -107,15 +102,23 @@ function flattenProgressEntries(entries: ProgressEntry[], expandedFoldIds: Reado
 		}
 		const { fold } = entry;
 		const expanded = expandedFoldIds.has(fold.id);
-		flat.push({ raw: formatFoldHeader(fold, expanded), foldId: fold.id, isFoldHeader: true });
 		if (expanded) {
-			for (const line of fold.lines) {
+			for (let i = 0; i < fold.lines.length; i++) {
+				const isToggle = i === fold.lines.length - 1;
 				flat.push({
-					raw: `  · ${line.slice(2)}`,
-					foldId: fold.id,
-					isFoldChild: true,
+					raw: fold.lines[i]!,
+					...(isToggle
+						? { foldId: fold.id, isFoldToggle: true, foldExpanded: true }
+						: {}),
 				});
 			}
+		} else {
+			flat.push({
+				raw: fold.lines[fold.lines.length - 1]!,
+				foldId: fold.id,
+				isFoldToggle: true,
+				foldExpanded: false,
+			});
 		}
 	}
 	return flat;
@@ -124,10 +127,13 @@ function flattenProgressEntries(entries: ProgressEntry[], expandedFoldIds: Reado
 function tailProgressViewLines(lines: ProgressViewLine[], max: number): ProgressViewLine[] {
 	if (lines.length <= max) return lines;
 	let start = lines.length - max;
-	if (lines[start]?.isFoldChild && lines[start]?.foldId) {
-		const id = lines[start]!.foldId!;
-		while (start > 0 && lines[start - 1]?.foldId === id) start--;
-		if (lines[start - 1]?.isFoldHeader && lines[start - 1]?.foldId === id) start--;
+	const visibleFoldIds = new Set<string>();
+	for (const line of lines.slice(start)) {
+		if (line.foldId) visibleFoldIds.add(line.foldId);
+	}
+	for (const foldId of visibleFoldIds) {
+		const firstIdx = lines.findIndex((l) => l.foldId === foldId);
+		if (firstIdx >= 0 && firstIdx < start) start = firstIdx;
 	}
 	return lines.slice(start);
 }
@@ -138,8 +144,12 @@ export function buildProgressViewLines(lines: string[], options: ProgressViewOpt
 	return tailProgressViewLines(flat, options.tailLines ?? TAIL_LINES);
 }
 
-export function foldHeaderIds(viewLines: ProgressViewLine[]): string[] {
-	return viewLines.flatMap((line) => (line.isFoldHeader && line.foldId ? [line.foldId] : []));
+export function foldGroupIds(viewLines: ProgressViewLine[]): string[] {
+	return [
+		...new Set(
+			viewLines.flatMap((line) => (line.isFoldToggle && line.foldId ? [line.foldId] : [])),
+		),
+	];
 }
 
 export interface LoaderOptions {

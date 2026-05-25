@@ -1,11 +1,12 @@
 import { writeFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { reviewerInvocation, workerInvocation } from "./agents.ts";
+import { reviewerFixInvocation, reviewerInvocation, workerInvocation } from "./agents.ts";
 import { watchAntigravityProgress } from "./antigravity-progress.ts";
 import { appendLiveLog, initLiveLog } from "./live-log.ts";
 import { spawnProcess, type RunResult } from "./spawn-process.ts";
 import { runWithLoader } from "./run-command.ts";
 import { unmetExecDeps } from "./task-deps.ts";
+import { runExecGate, type ExecGateResult } from "./exec-gate.ts";
 import { tailLines } from "./run-display.ts";
 import { artifactPath, createRunId, ensureRunDirs, reviewVerdictPath, tracePath } from "./agent-paths.ts";
 import { loadTask, requireTask, updateTaskStatus } from "./agent-store.ts";
@@ -27,7 +28,7 @@ import {
 	formatReviewVerdict,
 	reviewStatusFromVerdict,
 } from "./task-status.ts";
-import type { AgentTask, Reviewer, TaskRun, TaskStatus, Worker } from "./types.ts";
+import type { AgentTask, Reviewer, ReviewVerdictPayload, TaskRun, TaskStatus, Worker } from "./types.ts";
 
 export interface InvokeSpec {
 	label: string;
@@ -47,18 +48,22 @@ export interface TaskRunDeps {
 	cwd: string;
 	invoke: InvokeAdapter;
 	refreshWidget?: () => void;
+	runExecGate?: (opts?: { liveLogPath?: string }) => Promise<ExecGateResult>;
+	onExecStarted?: (info: { taskId: string; livePath: string; label: string }) => void;
 }
 
 export function makeTaskRunDeps(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
 	refreshWidget: () => void,
-	opts?: { silent?: boolean },
+	opts?: { silent?: boolean; onExecStarted?: TaskRunDeps["onExecStarted"] },
 ): TaskRunDeps {
 	return {
 		cwd: ctx.cwd,
 		invoke: opts?.silent ? makeSilentInvokeAdapter(pi, ctx) : makeInvokeAdapter(pi, ctx),
 		refreshWidget,
+		runExecGate: (gateOpts) => runExecGate(pi, ctx.cwd, gateOpts),
+		onExecStarted: opts?.onExecStarted,
 	};
 }
 
@@ -166,6 +171,14 @@ export async function runExecPhase(
 	const live = tracePath(deps.cwd, taskId, runId);
 	ensureRunDirs(logPath, live);
 
+	deps.onExecStarted?.({
+		taskId,
+		livePath: live,
+		label: incorporatingReview
+			? `Executing ${taskId} with ${agent.cli} · review retry`
+			: `Executing ${taskId} with ${agent.cli}`,
+	});
+
 	const promptPath = writePromptSnapshot(deps.cwd, {
 		task_id: taskId,
 		phase: "exec",
@@ -226,6 +239,23 @@ export async function runExecPhase(
 			);
 		}
 
+		let gateLine = "";
+		if (deps.runExecGate) {
+			const gate = await deps.runExecGate({ liveLogPath: live });
+			if (!gate.passed && !gate.skipped) {
+				const gateNote = gate.output ? `\n\n${gate.output}` : "";
+				writeFileSync(logPath, `${logBody}\n--- pre-review gate ---\n${gate.output ?? ""}`, "utf-8");
+				patchTaskStatus(deps, taskId, revertStatus, {
+					artifacts: { log: logPath, liveTrace: live, execPrompt: promptPath },
+					run: { ...run, exitCode: 1 },
+				});
+				throw new Error(`Pre-review gate failed for ${taskId}.${gateNote}`);
+			}
+			if (!gate.skipped && gate.files.length > 0) {
+				gateLine = `Pre-review gate: ruff OK (${gate.files.length} file(s))`;
+			}
+		}
+
 		const updated = patchTaskStatus(deps, taskId, "done", {
 			worker,
 			artifacts: { log: logPath, liveTrace: live, execPrompt: promptPath },
@@ -238,10 +268,13 @@ export async function runExecPhase(
 			: "";
 		const summary = [
 			`${taskId} done (${agent.cli})${retryNote}`,
+			gateLine,
 			`Prompt: ${promptPath}`,
 			`Log: ${logPath}`,
 			`Live trace: ${live}`,
-		].join("\n");
+		]
+			.filter(Boolean)
+			.join("\n");
 
 		return { summary, task: updated };
 	} catch (err) {
@@ -340,4 +373,82 @@ export async function runReviewPhase(
 		.join("\n");
 
 	return { summary, task: updated, passed };
+}
+
+export async function runReviewFixPhase(
+	deps: TaskRunDeps,
+	taskId: string,
+	reviewer: Reviewer | undefined,
+	payload: ReviewVerdictPayload,
+): Promise<{ summary: string; logPath: string }> {
+	const task = requireTask(deps.cwd, taskId);
+
+	const { agent, prompt, invocation } = reviewerFixInvocation(
+		deps.cwd,
+		taskId,
+		task.title,
+		reviewer,
+		payload,
+	);
+
+	const runId = createRunId(agent.cli);
+	const startedAt = new Date().toISOString();
+	const logPath = artifactPath(deps.cwd, "review_fix", taskId, runId);
+	const live = tracePath(deps.cwd, taskId, runId);
+	ensureRunDirs(logPath, live);
+
+	const promptPath = writePromptSnapshot(deps.cwd, {
+		task_id: taskId,
+		phase: "review_fix",
+		run_id: runId,
+		cli: agent.cli,
+		reviewer: reviewer ?? agent.reviewer ?? agent.cli,
+		incorporated_review_run_id: payload.review_run_id,
+		finding_count: payload.findings.length,
+	}, prompt);
+
+	const result = await deps.invoke({
+		label: `Review-fix ${taskId} with ${agent.cli}`,
+		command: invocation.command,
+		args: invocation.args,
+		stdin: invocation.stdin,
+		jsonStream: invocation.jsonStream,
+		antigravityProgress: invocation.antigravityProgress,
+		liveLogPath: live,
+		loaderContext: formatReviewLoaderContext({ runId: payload.review_run_id, payload }),
+		timeoutMs: 60 * 60 * 1000,
+	});
+
+	const logBody = [result.stdout, result.stderr].filter(Boolean).join("\n--- stderr ---\n");
+	writeFileSync(logPath, logBody, "utf-8");
+
+	if (result.killed) throw new Error(`Review-fix cancelled (${taskId})`);
+	if (result.code !== 0) {
+		throw new Error(
+			result.stderr.trim() ||
+				`${agent.cli} review-fix failed (exit ${result.code}). See ${logPath}`,
+		);
+	}
+
+	const endedAt = new Date().toISOString();
+	const run: TaskRun = {
+		runId,
+		phase: "review_fix",
+		worker: agent.cli === "codex" || agent.cli === "claude" ? agent.cli : undefined,
+		startedAt,
+		endedAt,
+		exitCode: result.code,
+		paths: { output: logPath, live, prompt: promptPath },
+	};
+
+	patchTaskStatus(deps, taskId, "review_fail", { run });
+
+	const summary = [
+		`Review-fix ${taskId} finished (${agent.cli})`,
+		`Log: ${logPath}`,
+		`Live trace: ${live}`,
+		`Prompt: ${promptPath}`,
+	].join("\n");
+
+	return { summary, logPath };
 }

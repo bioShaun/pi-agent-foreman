@@ -47,9 +47,12 @@ pi -e /path/to/pi-agent-foreman/index.ts
 | `/agent resume` | 从 `boulder.json` 恢复上次中断的 batch |
 | `/agent resume --continue-on-error` | 恢复执行，单个任务失败仍继续后续 |
 | `/agent resume status` | 查看可恢复信息，不执行 |
-| `/agent review T001 [--reviewer claude\|codex]` | 审核未提交变更（默认 Codex） |
-| `/agent review --all [--reviewer claude\|codex]` | 按 active plan 审核全部 `done` 任务 |
+| `/agent review T001 [--reviewer claude\|codex] [--fix]` | 审核；`--fix` 有界修复循环（lint / reviewer） |
+| `/agent review --all [--reviewer claude\|codex] [--fix]` | 审核 `done`；`--fix` 时含 `review_fail` |
 | | 可选：`--from T003`、`--continue-on-error` |
+| `/agent mark_pass T001` | 手动修完后标记 `review_pass` |
+| `/agent mark_pass --all [--from T003]` | 批量标记 `done` / `review_fail` / stale `running` |
+| `/agent clear` | 清除 active plan；计划全部 `review_pass` 时侧边栏自动隐藏 |
 | `/agent logs T001` | 运行历史与 artifact 路径 |
 | `/agent help` | 命令帮助 |
 
@@ -94,6 +97,16 @@ pi -e /path/to/pi-agent-foreman/index.ts
 | `done` | 执行完成，待审核 |
 | `review_pass` | 审核通过 |
 | `review_fail` | 审核未通过 —— 再次 exec 会带上 review 反馈 |
+
+## Pre-review gate（exec 后、review 前）
+
+Worker 成功退出后，foreman 会对 **与 reviewer 相同范围** 的变更 Python 文件跑 `ruff check`（staged + unstaged + untracked，排除 `.agent/`）：
+
+- 通过 → 任务标为 `done`，可进入 review
+- 失败 → exec **不算完成**，状态回退，错误里附带 `ruff check … --fix` 提示
+- 跳过：无变更 `.py`、找不到 ruff、或 `FOREMAN_SKIP_EXEC_GATE=1`
+
+Ruff 解析顺序：`.venv/bin/ruff` → `uv run ruff` → `ruff`。
 
 ## 状态目录（`.agent/`）
 

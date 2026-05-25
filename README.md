@@ -47,9 +47,11 @@ pi -e /path/to/pi-agent-foreman/index.ts
 | `/agent resume` | Resume last stopped batch from `boulder.json` |
 | `/agent resume --continue-on-error` | Resume and keep going after task failures |
 | `/agent resume status` | Show resume info without running |
-| `/agent review T001 [--reviewer claude\|codex]` | Review uncommitted changes (default: Codex) |
-| `/agent review --all [--reviewer claude\|codex]` | Review all `done` tasks in active plan |
-| | Options: `--from T003`, `--continue-on-error` |
+| `/agent review T001 [--reviewer claude\|codex] [--fix]` | Review uncommitted changes (default: Codex) |
+| `/agent review --all [--reviewer claude\|codex] [--fix]` | Review all `done` tasks (`--fix` also includes `review_fail`) |
+| | Options: `--from T003`, `--continue-on-error`, `--fix` (bounded review-fix loop) |
+| `/agent mark_pass T001` | After **manual** fix/review — set task to `review_pass` |
+| `/agent mark_pass --all [--from T003]` | Mark all `done` / `review_fail` / stale `running` in plan |
 | `/agent logs T001` | Run history and artifact paths |
 | `/agent help` | Command reference |
 
@@ -85,6 +87,16 @@ Optional frontmatter:
 
 After `review_fail`, re-running `/agent exec T001` injects structured findings from `.agent/artifacts/review/T001/{runId}.json` (or falls back to the review report). Verify via `.agent/prompts/exec/T001/{runId}.md` (`incorporated_review_run_id` in frontmatter).
 
+### Review-fix (`--fix`)
+
+`/agent review T001 --fix` runs a **bounded** loop (see [ADR 0002](docs/adr/0002-review-fix-loop.md)):
+
+1. Review → if pass, stop.
+2. **Major/critical** findings → `review_fail` (use `/agent exec`).
+3. **Lint-only** → `ruff check --fix` + pre-review gate → `review_pass` if gate OK (no re-review).
+4. **Minor** (or lint+minor after step 3) → reviewer fix (prompt mode) → **one** re-review → pass or fail.
+5. Stops if working tree unchanged or findings unchanged after fix (no infinite loop).
+
 ## Task lifecycle
 
 | Status | Meaning |
@@ -94,6 +106,16 @@ After `review_fail`, re-running `/agent exec T001` injects structured findings f
 | `done` | Exec finished, awaiting review |
 | `review_pass` | Review passed |
 | `review_fail` | Review failed — re-exec picks up review feedback |
+
+## Pre-review gate (after exec, before review)
+
+After the worker exits 0, foreman runs `ruff check` on **changed Python files** in the same scope the reviewer uses (staged + unstaged + untracked, excluding `.agent/`):
+
+- **Pass** → task becomes `done`, review may proceed
+- **Fail** → exec is **not** complete; status reverts; error includes a `ruff check … --fix` hint
+- **Skipped** when there are no changed `.py` files, ruff is unavailable, or `FOREMAN_SKIP_EXEC_GATE=1`
+
+Ruff resolution: `.venv/bin/ruff` → `uv run ruff` → `ruff` on PATH.
 
 ## State (`.agent/`)
 

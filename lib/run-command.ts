@@ -7,7 +7,8 @@ import { buildThemedLoaderPinned, buildThemedLoaderProgress } from "./loader-the
 import { appendLiveLog, ensureLiveOutputSection, initLiveLog } from "./live-log.ts";
 import {
 	buildProgressViewLines,
-	foldHeaderIds,
+	FOLD_ARROW_HIT_COLS,
+	foldGroupIds,
 	isLoaderProgressLine,
 	loaderFallback,
 	pushDisplayLine,
@@ -95,41 +96,29 @@ export async function runWithLoader(
 
 		const recentLines: string[] = [];
 		const expandedFoldIds = new Set<string>();
-		let selectedFoldId: string | undefined;
 		const started = Date.now();
 		let outputSectionOpen = !structured;
 		const fallback = loaderFallback(options);
 		let mouseTracking = false;
 		let componentLineCount = 0;
-		const foldHeaderAtLine = new Map<number, string>();
+		const foldToggleAtLine = new Map<number, string>();
 		let cachedViewLines: ProgressViewLine[] = [];
 
 		const updateLayoutHints = (pinnedLineCount: number, viewLines: ProgressViewLine[]) => {
 			const progressStart = 1 + pinnedLineCount;
-			foldHeaderAtLine.clear();
+			foldToggleAtLine.clear();
 			for (let i = 0; i < viewLines.length; i++) {
 				const line = viewLines[i]!;
-				if (line.isFoldHeader && line.foldId) {
-					foldHeaderAtLine.set(progressStart + i, line.foldId);
+				if (line.isFoldToggle && line.foldId) {
+					foldToggleAtLine.set(progressStart + i, line.foldId);
 				}
 			}
 			componentLineCount = 1 + pinnedLineCount + viewLines.length + 1 + 1 + 1;
 		};
 
-		const setFoldExpanded = (foldId: string, expanded: boolean) => {
-			selectedFoldId = foldId;
-			if (expanded) expandedFoldIds.add(foldId);
-			else expandedFoldIds.delete(foldId);
-		};
-
 		const toggleFold = (foldId: string) => {
-			setFoldExpanded(foldId, !expandedFoldIds.has(foldId));
-		};
-
-		const resolveSelectedFoldId = (headers: string[]): string | undefined => {
-			if (headers.length === 0) return undefined;
-			if (selectedFoldId && headers.includes(selectedFoldId)) return selectedFoldId;
-			return headers[headers.length - 1];
+			if (expandedFoldIds.has(foldId)) expandedFoldIds.delete(foldId);
+			else expandedFoldIds.add(foldId);
 		};
 
 		const enableMouseTracking = () => {
@@ -144,23 +133,10 @@ export async function runWithLoader(
 			mouseTracking = false;
 		};
 
-		const toggleSelectedFold = () => {
-			const foldId = resolveSelectedFoldId(foldHeaderIds(cachedViewLines));
-			if (foldId) toggleFold(foldId);
-		};
-
-		const moveFoldSelection = (delta: number) => {
-			const headers = foldHeaderIds(cachedViewLines);
-			if (headers.length === 0) return;
-			const current = resolveSelectedFoldId(headers);
-			const index = current ? headers.indexOf(current) : headers.length - 1;
-			selectedFoldId = headers[(index + delta + headers.length) % headers.length];
-		};
-
 		const refreshFooter = (hasFolds: boolean) => {
 			if (hasFolds) enableMouseTracking();
 			const hint = hasFolds
-				? `Enter/点击 展开 · ↑↓ 选择 · Esc cancel · tail -f ${liveHint}`
+				? `点击 ▸/▾ 展开/收起 · Esc cancel · tail -f ${liveHint}`
 				: `Esc cancel · tail -f ${liveHint}`;
 			footerOutput.setText(theme.fg("dim", hint));
 		};
@@ -168,20 +144,12 @@ export async function runWithLoader(
 		const refresh = () => {
 			const elapsedMs = Date.now() - started;
 			cachedViewLines = buildProgressViewLines(recentLines, { expandedFoldIds });
-			const headers = foldHeaderIds(cachedViewLines);
-			selectedFoldId = resolveSelectedFoldId(headers);
 			const pinnedText = buildThemedLoaderPinned(theme, label, elapsedMs, loaderContext);
 			pinnedOutput.setText(pinnedText);
 			progressOutput.setText(
-				buildThemedLoaderProgress(
-					theme,
-					recentLines,
-					fallback,
-					{ expandedFoldIds, selectedFoldId },
-					cachedViewLines,
-				),
+				buildThemedLoaderProgress(theme, recentLines, fallback, { expandedFoldIds }, cachedViewLines),
 			);
-			refreshFooter(headers.length > 0);
+			refreshFooter(foldGroupIds(cachedViewLines).length > 0);
 			updateLayoutHints(pinnedText.split("\n").length, cachedViewLines);
 			redraw();
 		};
@@ -238,25 +206,24 @@ export async function runWithLoader(
 			done(result);
 		});
 
-		const isMousePress = (data: string): number | null => {
-			const match = data.match(/^\x1b\[<(\d+);\d+;(\d+)([mM])$/);
+		const parseMousePress = (data: string): { row: number; col: number } | null => {
+			const match = data.match(/^\x1b\[<(\d+);(\d+);(\d+)([mM])$/);
 			if (!match) return null;
 			const button = Number(match[1]);
-			const release = match[3] === "m";
+			const release = match[4] === "m";
 			if (release || (button !== 0 && button !== 32)) return null;
-			return Number(match[2]);
+			return { col: Number(match[2]), row: Number(match[3]) };
 		};
 
-		const handleMousePress = (row: number) => {
-			if (componentLineCount <= 0) {
-				toggleSelectedFold();
-				return;
-			}
+		/** Returns true when the click toggled a fold (event consumed). */
+		const handleMousePress = (row: number, col: number): boolean => {
+			if (componentLineCount <= 0) return false;
 			const topRow = Math.max(1, tui.terminal.rows - componentLineCount + 1);
 			const relLine = row - topRow;
-			const foldId = foldHeaderAtLine.get(relLine);
-			if (foldId) toggleFold(foldId);
-			else toggleSelectedFold();
+			const foldId = foldToggleAtLine.get(relLine);
+			if (!foldId || col > FOLD_ARROW_HIT_COLS) return false;
+			toggleFold(foldId);
+			return true;
 		};
 
 		return {
@@ -264,42 +231,13 @@ export async function runWithLoader(
 			invalidate: redraw,
 			dispose: () => disableMouseTracking(),
 			handleInput: (data: string) => {
-				const mouseRow = isMousePress(data);
-				if (mouseRow !== null) {
-					handleMousePress(mouseRow);
-					scheduleRefresh();
-					return;
-				}
-				if (kb.matches(data, "tui.select.up")) {
-					moveFoldSelection(-1);
-					scheduleRefresh();
-					return;
-				}
-				if (kb.matches(data, "tui.select.down")) {
-					moveFoldSelection(1);
-					scheduleRefresh();
-					return;
-				}
-				if (kb.matches(data, "tui.select.confirm") || kb.matches(data, " ")) {
-					toggleSelectedFold();
-					scheduleRefresh();
-					return;
-				}
-				if (kb.matches(data, "tui.editor.cursorRight")) {
-					const foldId = resolveSelectedFoldId(foldHeaderIds(cachedViewLines));
-					if (foldId) {
-						setFoldExpanded(foldId, true);
+				const mouse = parseMousePress(data);
+				if (mouse !== null) {
+					if (handleMousePress(mouse.row, mouse.col)) {
 						scheduleRefresh();
+						return;
 					}
-					return;
-				}
-				if (kb.matches(data, "tui.editor.cursorLeft")) {
-					const foldId = resolveSelectedFoldId(foldHeaderIds(cachedViewLines));
-					if (foldId) {
-						setFoldExpanded(foldId, false);
-						scheduleRefresh();
-					}
-					return;
+					// Non-arrow clicks: do not return — allow terminal selection / other handlers.
 				}
 				if (kb.matches(data, "escape")) {
 					disableMouseTracking();
@@ -377,17 +315,18 @@ export function parseReviewArgs(
 	args: string,
 	defaultReviewer: Reviewer = "codex",
 ):
-	| { mode: "single"; taskId: string; reviewer: Reviewer }
-	| { mode: "batch"; reviewer: Reviewer; fromTaskId?: string; continueOnError: boolean } {
+	| { mode: "single"; taskId: string; reviewer: Reviewer; fix: boolean }
+	| { mode: "batch"; reviewer: Reviewer; fromTaskId?: string; continueOnError: boolean; fix: boolean } {
 	const trimmed = args.trim();
 	if (!trimmed) {
 		throw new Error(
-			"Usage: /agent review T001 [--reviewer claude|codex] | /agent review --all [--reviewer claude|codex] [--from T003] [--continue-on-error]",
+			"Usage: /agent review T001 [--reviewer claude|codex] [--fix] | /agent review --all [--reviewer claude|codex] [--fix] [--from T003] [--continue-on-error]",
 		);
 	}
 
 	const reviewerMatch = trimmed.match(/--reviewer\s+(\w+)/i);
 	const reviewer = parseReviewer(reviewerMatch?.[1]?.toLowerCase() ?? defaultReviewer, defaultReviewer);
+	const fix = /--fix\b/i.test(trimmed);
 
 	if (/^--all\b/i.test(trimmed)) {
 		const fromMatch = trimmed.match(/--from\s+(T\d+)/i);
@@ -396,16 +335,17 @@ export function parseReviewArgs(
 			reviewer,
 			fromTaskId: fromMatch?.[1]?.toUpperCase(),
 			continueOnError: /--continue-on-error\b/i.test(trimmed),
+			fix,
 		};
 	}
 
 	const taskId = trimmed.match(/^(T\d+)/i)?.[1]?.toUpperCase();
 	if (!taskId) {
 		throw new Error(
-			"Usage: /agent review T001 [--reviewer claude|codex] | /agent review --all [--reviewer claude|codex] [--from T003] [--continue-on-error]",
+			"Usage: /agent review T001 [--reviewer claude|codex] [--fix] | /agent review --all [--reviewer claude|codex] [--fix] [--from T003] [--continue-on-error]",
 		);
 	}
-	return { mode: "single", taskId, reviewer };
+	return { mode: "single", taskId, reviewer, fix };
 }
 
 export function parseRunArgs(

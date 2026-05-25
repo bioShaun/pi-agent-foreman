@@ -35,7 +35,7 @@ export interface ReviewVerdictPayload {
 	findings: ReviewFinding[];
 }
 
-export type RunPhase = "exec" | "review" | "plan";
+export type RunPhase = "exec" | "review" | "review_fix" | "plan";
 
 export interface TaskRun {
 	runId: string;
