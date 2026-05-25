@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { writeFileSync } from "node:fs";
-import { assertRoleAgentAvailable, plannerInvocation } from "./agents.ts";
+import { assertRoleAgentAvailable, plannerInvocation, plannerRefineInvocation } from "./agents.ts";
 import { parsePlanOutput } from "./parse-plan.ts";
 import {
 	parseExecArgs,
@@ -9,11 +9,12 @@ import {
 	parseRunArgs,
 	runWithLoader,
 } from "./run-command.ts";
-import { artifactPath, createRunId, ensureRunDirs } from "./agent-paths.ts";
+import { artifactPath, createRunId, ensureRunDirs, planDraftPath } from "./agent-paths.ts";
 import {
 	clearActivePlan,
 	createPlanFromParsed,
 	loadManifest,
+	loadPlan,
 	listTasks,
 	loadBoulder,
 	loadTask,
@@ -30,7 +31,7 @@ import { withParallelBatchDisplay, type ParallelExecListener } from "./parallel-
 import { markTaskReviewPass, parseMarkPassArgs, tasksForMarkPassBatch } from "./mark-pass.ts";
 import { isActivePlanComplete, refreshTaskWidget } from "./task-widget.ts";
 import { isExecRunnable, isRunComplete, isRunStillFailing } from "./task-status.ts";
-import type { Reviewer, Worker } from "./types.ts";
+import { isPlanner, isWorker, type Planner, type Reviewer, type Worker } from "./types.ts";
 
 function pipelineTaskDeps(
 	pi: ExtensionAPI,
@@ -40,26 +41,36 @@ function pipelineTaskDeps(
 	return makeTaskRunDeps(pi, ctx, () => refreshTaskWidget(ctx), opts);
 }
 
-export async function runPlan(pi: ExtensionAPI, ctx: ExtensionCommandContext, goal: string): Promise<string> {
-	if (!goal.trim()) throw new Error("Usage: /agent plan <goal>");
+function resolveDefaultWorker(cwd: string, fallback: Worker = "claude"): Worker {
+	const manifest = loadManifest(cwd);
+	if (!manifest.activePlanId) return fallback;
+	const plan = loadPlan(cwd, manifest.activePlanId);
+	return plan?.worker ?? fallback;
+}
 
-	const agent = await assertRoleAgentAvailable(pi, ctx.cwd, "planner");
-	const { invocation } = plannerInvocation(ctx.cwd, goal);
+async function invokePlanner(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	goal: string,
+	planner?: Planner,
+	refine?: { priorPlan: string; refinement: string },
+): Promise<{ raw: string; cli: string; runId: string }> {
+	const agent = await assertRoleAgentAvailable(pi, ctx.cwd, "planner", undefined, undefined, undefined, planner);
+	const { invocation } = refine
+		? plannerRefineInvocation(ctx.cwd, goal, refine.priorPlan, refine.refinement, planner)
+		: plannerInvocation(ctx.cwd, goal, planner);
 
-	const planRunId = createRunId(agent.cli);
-	const result = await runWithLoader(
-		pi,
-		ctx,
-		`Planning: ${goal.slice(0, 60)}…`,
-		invocation.command,
-		invocation.args,
-		{
-			cwd: ctx.cwd,
-			stdin: invocation.stdin,
-			jsonStream: invocation.jsonStream,
-			timeoutMs: 30 * 60 * 1000,
-		},
-	);
+	const runId = createRunId(agent.cli);
+	const label = refine
+		? `Re-planning (revision): ${goal.slice(0, 50)}…`
+		: `Planning: ${goal.slice(0, 60)}…`;
+	const result = await runWithLoader(pi, ctx, label, invocation.command, invocation.args, {
+		cwd: ctx.cwd,
+		stdin: invocation.stdin,
+		jsonStream: invocation.jsonStream,
+		antigravityProgress: invocation.antigravityProgress,
+		timeoutMs: 30 * 60 * 1000,
+	});
 
 	if (result.killed) throw new Error("Planning cancelled");
 	if (result.code !== 0) {
@@ -73,21 +84,251 @@ export async function runPlan(pi: ExtensionAPI, ctx: ExtensionCommandContext, go
 	}
 
 	const raw = result.stdout.trim() || result.stderr.trim();
-	const parsed = parsePlanOutput(raw, goal);
-	const plan = createPlanFromParsed(ctx.cwd, parsed.goal, raw, parsed);
+	if (!raw) throw new Error(`${agent.cli} produced no output`);
+	return { raw, cli: agent.cli, runId };
+}
 
-	const planArtifact = artifactPath(ctx.cwd, "plan", plan.id, planRunId);
+/** Drop fenced code blocks; the draft should show the human plan, not the JSON payload. */
+function stripCodeBlocks(raw: string): string {
+	return raw.replace(/```[\s\S]*?```/g, "").replace(/\n{3,}/g, "\n\n").trimEnd();
+}
+
+function normalizeHeading(line: string): string {
+	return line
+		.replace(/^\s*#{1,6}\s*/, "")
+		.replace(/^\s*\*\*(.*?)\*\*\s*$/, "$1")
+		.trim()
+		.toLowerCase();
+}
+
+function isMarkdownHeadingLine(line: string): boolean {
+	return /^\s*#{1,6}\s+\S/.test(line) || /^\s*\*\*[^*]+\*\*\s*$/.test(line);
+}
+
+function cleanPlanNarrative(raw: string): string {
+	const withoutCode = stripCodeBlocks(raw).trim();
+	const lines = withoutCode.split(/\r?\n/);
+	const humanPlanIndex = lines.findIndex((line) =>
+		isMarkdownHeadingLine(line) &&
+		["human-readable plan", "human readable plan", "plan"].includes(normalizeHeading(line)),
+	);
+	const relevantLines = humanPlanIndex >= 0 ? lines.slice(humanPlanIndex + 1) : lines;
+
+	const cleaned: string[] = [];
+	let skipSection = false;
+	const skippedHeadings = new Set([
+		"repository findings",
+		"repo findings",
+		"repository scan",
+		"read-only scan",
+		"sources",
+		"references",
+	]);
+
+	for (const line of relevantLines) {
+		const heading = normalizeHeading(line);
+		if (isMarkdownHeadingLine(line) && skippedHeadings.has(heading)) {
+			skipSection = true;
+			continue;
+		}
+		if (skipSection && isMarkdownHeadingLine(line)) {
+			skipSection = false;
+		}
+		if (!skipSection) cleaned.push(line);
+	}
+
+	return cleaned.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+const DIVIDER = "─".repeat(60);
+
+function parsePlanArgs(input: string): { goal: string; applyNow: boolean; planner?: Planner; worker?: Worker } {
+	const parts = input.trim().split(/\s+/).filter(Boolean);
+	const applyNow = parts.includes("--apply");
+	let planner: Planner | undefined;
+	let worker: Worker | undefined;
+	const goalParts: string[] = [];
+
+	for (let i = 0; i < parts.length; i++) {
+		const part = parts[i]!;
+		if (part === "--apply") continue;
+		if (part.startsWith("--planner=")) {
+			const rawPlanner = part.slice("--planner=".length);
+			if (!rawPlanner) throw new Error("--planner requires one of: claude, codex, antigravity");
+			const candidate = rawPlanner.toLowerCase();
+			if (!isPlanner(candidate)) throw new Error(`Unknown planner: ${rawPlanner}`);
+			planner = candidate;
+			continue;
+		}
+		if (part === "--planner") {
+			const rawPlanner = parts[++i];
+			if (!rawPlanner) throw new Error("--planner requires one of: claude, codex, antigravity");
+			const candidate = rawPlanner.toLowerCase();
+			if (!isPlanner(candidate)) throw new Error(`Unknown planner: ${rawPlanner}`);
+			planner = candidate;
+			continue;
+		}
+		if (part.startsWith("--worker=")) {
+			const rawWorker = part.slice("--worker=".length);
+			if (!rawWorker) throw new Error("--worker requires one of: claude, codex, antigravity");
+			const candidate = rawWorker.toLowerCase();
+			if (!isWorker(candidate)) throw new Error(`Unknown worker: ${rawWorker}`);
+			worker = candidate;
+			continue;
+		}
+		if (part === "--worker") {
+			const rawWorker = parts[++i];
+			if (!rawWorker) throw new Error("--worker requires one of: claude, codex, antigravity");
+			const candidate = rawWorker.toLowerCase();
+			if (!isWorker(candidate)) throw new Error(`Unknown worker: ${rawWorker}`);
+			worker = candidate;
+			continue;
+		}
+		goalParts.push(part);
+	}
+
+	return {
+		goal: goalParts.join(" "),
+		applyNow,
+		planner,
+		worker,
+	};
+}
+
+function showPlanDraft(
+	pi: ExtensionAPI,
+	raw: string,
+	iteration: number,
+	goal: string,
+	planner?: Planner,
+	worker?: Worker,
+): void {
+	const titleLine =
+		iteration === 1
+			? `PLAN DRAFT`
+			: `PLAN DRAFT — iteration ${iteration}`;
+	const narrative = cleanPlanNarrative(raw);
+	const body = [
+		titleLine,
+		`Goal: ${goal}`,
+		planner ? `Planner: ${planner}` : null,
+		worker ? `Worker: ${worker}` : null,
+		DIVIDER,
+		narrative,
+		DIVIDER,
+		"No task files have been created yet.",
+		"Next: pick  Create tasks  /  Refine draft  /  Discard",
+	].filter(Boolean).join("\n");
+	pi.sendMessage(
+		{
+			customType: "agent-pipeline-result",
+			content: body,
+			display: true,
+		},
+		{ triggerTurn: false },
+	);
+}
+
+function applyPlanDraft(
+	cwd: string,
+	goal: string,
+	raw: string,
+	cli: string,
+	planRunId: string,
+	planner?: Planner,
+	worker?: Worker,
+): string {
+	const draftPath = planDraftPath(cwd);
+	ensureRunDirs(draftPath);
+	writeFileSync(draftPath, raw, "utf-8");
+
+	const parsed = parsePlanOutput(raw, goal);
+	const plan = createPlanFromParsed(cwd, parsed.goal, raw, parsed, { planner, worker });
+
+	const planArtifact = artifactPath(cwd, "plan", plan.id, planRunId);
 	ensureRunDirs(planArtifact);
 	writeFileSync(planArtifact, raw, "utf-8");
 
 	return [
-		`Plan ${plan.id} created (${plan.taskIds.length} tasks)`,
+		`Plan ${plan.id} created (${plan.taskIds.length} tasks) via ${cli}`,
+		planner ? `Planner: ${planner}` : null,
+		worker ? `Worker: ${worker}` : null,
+		`Draft: ${draftPath}`,
 		`Plan artifact: ${planArtifact}`,
 		"",
-		formatTaskList(plan.taskIds.map((id) => loadTask(ctx.cwd, id)!).filter(Boolean)),
+		formatTaskList(plan.taskIds.map((id) => loadTask(cwd, id)!).filter(Boolean)),
 		"",
-		`Next: /agent run ${plan.taskIds[0]} --worker claude`,
-	].join("\n");
+		worker
+			? `Next: /agent run ${plan.taskIds[0]}  ·  or  /agent exec --all`
+			: `Next: /agent run ${plan.taskIds[0]} --worker claude  ·  or  /agent exec --all`,
+	].filter(Boolean).join("\n");
+}
+
+export async function runPlan(pi: ExtensionAPI, ctx: ExtensionCommandContext, goal: string): Promise<string> {
+	const { goal: cleanedGoal, applyNow, planner, worker } = parsePlanArgs(goal);
+	if (!cleanedGoal) {
+		throw new Error(
+			"Usage: /agent plan [--apply] [--planner claude|codex|antigravity] [--worker claude|codex|antigravity] <goal>",
+		);
+	}
+
+	let { raw, cli, runId } = await invokePlanner(pi, ctx, cleanedGoal, planner);
+	let iteration = 1;
+
+	if (applyNow) {
+		return applyPlanDraft(ctx.cwd, cleanedGoal, raw, cli, runId, planner, worker);
+	}
+
+	if (!ctx.hasUI) {
+		return [
+			"PLAN DRAFT",
+			`Goal: ${cleanedGoal}`,
+			planner ? `Planner: ${planner}` : null,
+			worker ? `Worker: ${worker}` : null,
+			DIVIDER,
+			cleanPlanNarrative(raw),
+			DIVIDER,
+			worker
+				? `No task files created. Re-run with \`/agent plan --apply${planner ? ` --planner ${planner}` : ""} --worker ${worker} <goal>\` to create tasks in a non-interactive context.`
+				: `No task files created. Re-run with \`/agent plan --apply${planner ? ` --planner ${planner}` : ""} <goal>\` to create tasks in a non-interactive context.`,
+		].filter(Boolean).join("\n");
+	}
+
+	const OPT_APPLY = "Create tasks from this draft";
+	const OPT_REFINE = "Refine draft";
+	const OPT_DISCARD = "Discard";
+
+	while (true) {
+		showPlanDraft(pi, raw, iteration, cleanedGoal, planner, worker);
+
+		const choice = await ctx.ui.select(
+			"Plan ready — what next?",
+			[OPT_APPLY, OPT_REFINE, OPT_DISCARD],
+		);
+
+		if (!choice || choice === OPT_DISCARD) {
+			return `Plan discarded. No tasks created.\n\nRetry: /agent plan ${cleanedGoal}`;
+		}
+
+		if (choice === OPT_APPLY) {
+			return applyPlanDraft(ctx.cwd, cleanedGoal, raw, cli, runId, planner, worker);
+		}
+
+		const refinement = await ctx.ui.input(
+			"Refinement prompt — what should change?",
+			'e.g. "split T002 into two tasks", "add Q&A at the end", "use less time on T001"',
+		);
+		if (!refinement?.trim()) {
+			// Cancelled or empty — re-show same plan + dialog
+			continue;
+		}
+
+		iteration++;
+		({ raw, cli, runId } = await invokePlanner(pi, ctx, cleanedGoal, planner, {
+			priorPlan: raw,
+			refinement: refinement.trim(),
+		}));
+	}
 }
 
 async function execTask(
@@ -108,7 +349,8 @@ export async function runExec(
 	args: string,
 	defaultWorker: Worker = "claude",
 ): Promise<string> {
-	const parsed = parseExecArgs(args || `T001 --worker ${defaultWorker}`, defaultWorker);
+	const resolvedDefaultWorker = resolveDefaultWorker(ctx.cwd, defaultWorker);
+	const parsed = parseExecArgs(args || `T001 --worker ${resolvedDefaultWorker}`, resolvedDefaultWorker);
 	if (parsed.mode === "batch") {
 		return runExecAll(pi, ctx, parsed);
 	}
@@ -508,7 +750,8 @@ export async function runTask(
 	args: string,
 	defaultWorker: Worker = "claude",
 ): Promise<string> {
-	const { taskId, worker, reviewer } = parseRunArgs(args || `T001 --worker ${defaultWorker}`, defaultWorker);
+	const resolvedDefaultWorker = resolveDefaultWorker(ctx.cwd, defaultWorker);
+	const { taskId, worker, reviewer } = parseRunArgs(args || `T001 --worker ${resolvedDefaultWorker}`, resolvedDefaultWorker);
 	const deps = pipelineTaskDeps(pi, ctx);
 	const sections: string[] = [`## Run ${taskId} (exec → review)`];
 
@@ -583,7 +826,10 @@ export async function dispatchAgentCommand(
 		return [
 			"Agent Pipeline — Codex plans, workers execute, reviewers verify, fixer cleans up",
 			"",
-			"/agent plan <goal>                   Plan with Codex",
+			"/agent plan [--planner codex] [--worker claude] <goal>",
+			"                                     Draft a plan; no tasks until confirmed",
+			"/agent plan --apply [--planner codex] [--worker claude] <goal>",
+			"                                     Create tasks immediately (for non-interactive use)",
 			"/agent run T001 [--worker claude] [--reviewer claude|codex]",
 			"                                     Exec + review (single pass, no auto-retry)",
 			"/agent exec T001 [--worker claude]   Execute one task",

@@ -61,7 +61,7 @@ export async function runWithLoader(
 	if (!ctx.hasUI) {
 		return pi.exec(command, args, {
 			cwd: options?.cwd ?? ctx.cwd,
-			timeoutMs: options?.timeoutMs ?? 30 * 60 * 1000,
+			timeout: options?.timeoutMs ?? 30 * 60 * 1000,
 		});
 	}
 
@@ -245,7 +245,7 @@ export async function runWithLoader(
 					}
 					// Non-arrow clicks: do not return — allow terminal selection / other handlers.
 				}
-				if (kb.matches(data, "escape")) {
+				if (kb.matches(data, "tui.select.cancel")) {
 					disableMouseTracking();
 					agyWatcher?.stop();
 					handle.kill();

@@ -1,4 +1,4 @@
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadManifest, loadPlan, loadTask, listTasks } from "./agent-store.ts";
 import { statusIcon } from "./task-status.ts";
 import type { AgentPlan } from "./types.ts";
@@ -38,6 +38,6 @@ export function taskWidgetLines(cwd: string): string[] | undefined {
 	return [header, ...lines];
 }
 
-export function refreshTaskWidget(ctx: ExtensionCommandContext): void {
+export function refreshTaskWidget(ctx: ExtensionContext): void {
 	ctx.ui.setWidget("agent-pipeline", taskWidgetLines(ctx.cwd));
 }

@@ -7,9 +7,11 @@ import type {
 	AgentManifest,
 	AgentPlan,
 	AgentTask,
+	Planner,
 	ParsedPlan,
 	TaskRun,
 	TaskStatus,
+	Worker,
 } from "./types.ts";
 
 function ensureAgentDirs(cwd: string): void {
@@ -136,7 +138,13 @@ export function updateBoulderProgress(cwd: string, patch: Partial<AgentBoulder>)
 	saveBoulder(cwd, { ...existing, ...patch });
 }
 
-export function createPlanFromParsed(cwd: string, goal: string, raw: string, parsed: ParsedPlan): AgentPlan {
+export function createPlanFromParsed(
+	cwd: string,
+	goal: string,
+	raw: string,
+	parsed: ParsedPlan,
+	opts?: { planner?: Planner; worker?: Worker },
+): AgentPlan {
 	ensureAgentDirs(cwd);
 	const planId = nextPlanId(cwd);
 	const taskIds: string[] = [];
@@ -164,6 +172,7 @@ export function createPlanFromParsed(cwd: string, goal: string, raw: string, par
 			status: "pending",
 			prompt: item.prompt,
 			depends_on: item.depends_on,
+			worker: opts?.worker,
 			artifacts: {},
 			runs: [],
 			timestamps: { created: new Date().toISOString() },
@@ -177,6 +186,8 @@ export function createPlanFromParsed(cwd: string, goal: string, raw: string, par
 		goal,
 		raw,
 		taskIds,
+		planner: opts?.planner,
+		worker: opts?.worker,
 		createdAt: new Date().toISOString(),
 	};
 	writeFileSync(join(agentRoot(cwd), "plans", `${planId}.json`), `${JSON.stringify(plan, null, 2)}\n`, "utf-8");

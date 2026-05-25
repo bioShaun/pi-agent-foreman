@@ -38,3 +38,8 @@ export function ensureRunDirs(...paths: string[]): void {
 		mkdirSync(join(p, ".."), { recursive: true });
 	}
 }
+
+/** Most-recent plan draft (markdown) saved by /agent plan when the user clicks "Apply now". */
+export function planDraftPath(cwd: string): string {
+	return join(agentRoot(cwd), "drafts", "plan.md");
+}

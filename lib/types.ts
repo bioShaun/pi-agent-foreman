@@ -11,9 +11,14 @@ export function isReviewer(value: string): value is Reviewer {
 export const WORKERS = ["claude", "codex", "antigravity"] as const;
 
 export type Worker = (typeof WORKERS)[number];
+export type Planner = Worker;
 
 export function isWorker(value: string): value is Worker {
 	return (WORKERS as readonly string[]).includes(value);
+}
+
+export function isPlanner(value: string): value is Planner {
+	return isWorker(value);
 }
 
 export const FIXERS = ["claude", "codex", "antigravity"] as const;
@@ -86,6 +91,10 @@ export interface AgentPlan {
 	goal: string;
 	raw: string;
 	taskIds: string[];
+	/** Planner CLI used to create the plan. */
+	planner?: Planner;
+	/** Default exec worker for this plan when commands omit --worker. */
+	worker?: Worker;
 	createdAt: string;
 }
 

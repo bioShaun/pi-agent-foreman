@@ -9,7 +9,8 @@ description: Multi-CLI orchestration. Use /agent plan, run, exec, review, fix wh
 
 | Command | Action |
 |---------|--------|
-| `/agent plan <goal>` | Codex 规划 → `.agent/tasks/` |
+| `/agent plan [--planner codex] [--worker claude] <goal>` | 起草 plan，聊天中确认后才创建 `.agent/tasks/`；可选择规划 CLI 和默认执行 worker |
+| `/agent plan --apply [--planner codex] [--worker claude] <goal>` | 立即创建 plan/tasks，主要用于非交互场景 |
 | `/agent run T001 [--worker claude] [--reviewer claude\|codex]` | exec → review（单次，不自动重试） |
 | `/agent exec T001 [--worker claude]` | 单步执行 |
 | `/agent exec --all [--worker claude]` | 按 active plan 顺序 exec 全部 `pending` |

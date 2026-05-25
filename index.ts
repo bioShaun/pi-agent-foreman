@@ -97,9 +97,12 @@ export default function agentPipelineExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerMessageRenderer("agent-pipeline-result", (message, _opts, theme) => {
-		const text = typeof message.content === "string" ? message.content : String(message.content);
+		const raw = typeof message.content === "string" ? message.content : String(message.content);
 		const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
-		box.addChild(new Text(theme.fg("accent", "agent ") + text, 0, 0));
+		// Label sits on its own line so it never collides with the body's first character.
+		const label = theme.fg("accent", "▌ agent");
+		const body = raw.trimEnd();
+		box.addChild(new Text(`${label}\n${body}`, 0, 0));
 		return box;
 	});
 }

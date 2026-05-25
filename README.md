@@ -7,10 +7,15 @@ Pi TUI extension: **Codex** plans; **Claude** or **Codex** review; **Claude**, *
 ## Workflow
 
 ```
-plan ─► exec T001 ─► review T001 ─┐
-       │                          ├─► fix ─► review_pass
-       └► exec T002 ─► review T002┘   (single fixer pass over all review_fail tasks)
+plan ─► draft shown in chat ─► [Create tasks | Refine ↺ | Discard]
+                                  │
+                                  ▼
+                      exec T001 ─► review T001 ─┐
+                      │                         ├─► fix ─► review_pass
+                      └► exec T002 ─► review T002┘  (single fixer pass over all review_fail)
 ```
+
+`plan` is interactive: the draft is shown in the chat without creating `.agent/tasks/*`. The picker lets you **create tasks**, **refine** (input a revision prompt → re-plan → re-prompt), or **discard**. Add `--planner claude|codex|antigravity` to choose the planning CLI, and `--worker claude|codex|antigravity` to set the plan's default exec worker. Use `/agent plan --apply <goal>` only when you want task files created immediately. Applied drafts are also saved to `.agent/drafts/plan.md` for audit.
 
 ## Prerequisites
 
@@ -47,7 +52,8 @@ pi -e /path/to/pi-agent-pipeline/index.ts
 
 | Command | Description |
 |---------|-------------|
-| `/agent plan <goal>` | Codex generates a plan → tasks under `.agent/` |
+| `/agent plan [--planner codex] [--worker claude] <goal>` | Draft a plan → review in chat, then **Create tasks / Refine / Discard** prompt |
+| `/agent plan --apply [--planner codex] [--worker claude] <goal>` | Create plan/tasks immediately, mainly for non-interactive use |
 | `/agent list` | List tasks (widget also shows active plan in TUI) |
 | `/agent run T001 [--worker claude] [--reviewer claude\|codex]` | Exec → review (single pass, no auto-retry) |
 | `/agent exec T001 [--worker claude]` | Execute a single task |

@@ -7,7 +7,7 @@ import { renderReviewVerdictContract } from "./review-verdict.ts";
 import { buildRoleInvocation, type RoleInvocation } from "./role-invoke.ts";
 import { cliBinCandidates } from "./cli-resolve.ts";
 import { which } from "./run-command.ts";
-import type { Fixer, Reviewer, Worker } from "./types.ts";
+import type { Fixer, Planner, Reviewer, Worker } from "./types.ts";
 
 export type AgentRole = "planner" | "worker" | "reviewer" | "fixer";
 
@@ -17,6 +17,7 @@ export interface RoleAgent {
 	cli: string;
 	/** Executable on PATH; defaults from cli (e.g. antigravity → agy). */
 	bin?: string;
+	planner?: Planner;
 	worker?: Worker;
 	reviewer?: Reviewer;
 	fixer?: Fixer;
@@ -53,6 +54,7 @@ function loadAgentsFromDir(dir: string, source: "package" | "project"): RoleAgen
 			role,
 			cli: frontmatter.cli,
 			bin: frontmatter.bin,
+			planner: frontmatter.planner as Planner | undefined,
 			worker: frontmatter.worker as Worker | undefined,
 			reviewer: frontmatter.reviewer as Reviewer | undefined,
 			fixer: frontmatter.fixer as Fixer | undefined,
@@ -84,6 +86,7 @@ export function discoverRoleAgents(cwd: string): RoleAgent[] {
 }
 
 function agentKey(agent: RoleAgent): string {
+	if (agent.role === "planner") return `planner:${agent.planner ?? agent.cli}`;
 	if (agent.role === "worker") return `worker:${agent.worker ?? agent.cli}`;
 	if (agent.role === "reviewer") return `reviewer:${agent.reviewer ?? agent.cli}`;
 	if (agent.role === "fixer") return `fixer:${agent.fixer ?? agent.cli}`;
@@ -96,8 +99,27 @@ export function getAgent(
 	worker?: Worker,
 	reviewer?: Reviewer,
 	fixer?: Fixer,
+	planner?: Planner,
 ): RoleAgent {
 	const agents = discoverRoleAgents(cwd);
+	if (role === "planner") {
+		const base =
+			agents.find((a) => a.role === "planner" && (a.planner === "codex" || a.cli === "codex")) ??
+			agents.find((a) => a.role === "planner");
+		if (!base) throw new Error(`No planner agent. Add agents/planner.md or .pi/agents/`);
+		if (!planner) return base;
+		const match =
+			agents.find((a) => a.role === "planner" && a.planner === planner) ??
+			agents.find((a) => a.role === "planner" && a.cli === planner);
+		return match ?? {
+			...base,
+			name: `${base.name}-${planner}`,
+			cli: planner,
+			bin: undefined,
+			planner,
+			description: `${base.description} via ${planner}`,
+		};
+	}
 	if (role === "worker") {
 		const match =
 			agents.find((a) => a.role === "worker" && a.worker === worker) ??
@@ -132,9 +154,7 @@ export function getAgent(
 		}
 		return match;
 	}
-	const match = agents.find((a) => a.role === role);
-	if (!match) throw new Error(`No ${role} agent. Add agents/${role}.md or .pi/agents/`);
-	return match;
+	throw new Error(`No ${role} agent. Add agents/${role}.md or .pi/agents/`);
 }
 
 export function buildPlannerPrompt(agent: RoleAgent, goal: string): string {
@@ -196,8 +216,9 @@ export async function assertRoleAgentAvailable(
 	worker?: Worker,
 	reviewer?: Reviewer,
 	fixer?: Fixer,
+	planner?: Planner,
 ): Promise<RoleAgent> {
-	const agent = getAgent(cwd, role, worker, reviewer, fixer);
+	const agent = getAgent(cwd, role, worker, reviewer, fixer, planner);
 	const candidates = cliBinCandidates(agent.cli, agent.bin);
 	for (const bin of candidates) {
 		if (await which(pi, cwd, bin)) return agent;
@@ -207,9 +228,52 @@ export async function assertRoleAgentAvailable(
 	);
 }
 
-export function plannerInvocation(cwd: string, goal: string): { agent: RoleAgent; invocation: RoleInvocation } {
-	const agent = getAgent(cwd, "planner");
+export function plannerInvocation(
+	cwd: string,
+	goal: string,
+	planner?: Planner,
+): { agent: RoleAgent; invocation: RoleInvocation } {
+	const agent = getAgent(cwd, "planner", undefined, undefined, undefined, planner);
 	const prompt = buildPlannerPrompt(agent, goal);
+	return { agent, invocation: buildRoleInvocation(agent, { mode: "prompt", prompt }) };
+}
+
+export function buildPlannerRefinePrompt(
+	agent: RoleAgent,
+	goal: string,
+	priorPlan: string,
+	refinement: string,
+): string {
+	return [
+		agent.systemPrompt,
+		"",
+		"---",
+		"",
+		`Goal: ${goal}`,
+		"",
+		"## Previous plan (to revise)",
+		"",
+		priorPlan.trim(),
+		"",
+		"## Requested changes",
+		"",
+		refinement.trim(),
+		"",
+		"Regenerate the **full** plan (markdown narrative + ```json fenced task list).",
+		"Keep what is good; change only what the requested changes ask for.",
+		"Renumber task IDs starting from T001; preserve `depends_on` ordering after any reordering.",
+	].join("\n");
+}
+
+export function plannerRefineInvocation(
+	cwd: string,
+	goal: string,
+	priorPlan: string,
+	refinement: string,
+	planner?: Planner,
+): { agent: RoleAgent; invocation: RoleInvocation } {
+	const agent = getAgent(cwd, "planner", undefined, undefined, undefined, planner);
+	const prompt = buildPlannerRefinePrompt(agent, goal, priorPlan, refinement);
 	return { agent, invocation: buildRoleInvocation(agent, { mode: "prompt", prompt }) };
 }
 
