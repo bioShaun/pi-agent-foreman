@@ -9,9 +9,7 @@ export interface BoulderResumeRequest {
 	stoppedReason?: string;
 }
 
-export function parseResumeArgs(args: string): { continueOnError: boolean } {
-	return { continueOnError: /--continue-on-error\b/i.test(args.trim()) };
-}
+
 
 export function resolveBoulderResume(
 	cwd: string,

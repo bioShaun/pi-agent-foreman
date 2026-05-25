@@ -5,7 +5,7 @@ import { watchAntigravityProgress } from "./antigravity-progress.ts";
 import { appendLiveLog, initLiveLog } from "./live-log.ts";
 import { spawnProcess, type RunResult } from "./spawn-process.ts";
 import { runWithLoader } from "./run-command.ts";
-import { unmetExecDeps } from "./task-deps.ts";
+import { unmetExecDeps } from "./task-status.ts";
 import { runExecGate, type ExecGateResult } from "./exec-gate.ts";
 import { tailLines } from "./run-display.ts";
 import { artifactPath, createRunId, ensureRunDirs, reviewVerdictPath, tracePath } from "./agent-paths.ts";

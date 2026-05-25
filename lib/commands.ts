@@ -3,10 +3,6 @@ import { writeFileSync } from "node:fs";
 import { assertRoleAgentAvailable, plannerInvocation, plannerRefineInvocation } from "./agents.ts";
 import { parsePlanOutput } from "./parse-plan.ts";
 import {
-	parseExecArgs,
-	parseFixArgs,
-	parseReviewArgs,
-	parseRunArgs,
 	runWithLoader,
 } from "./run-command.ts";
 import { artifactPath, createRunId, ensureRunDirs, planDraftPath } from "./agent-paths.ts";
@@ -21,17 +17,33 @@ import {
 	saveBoulder,
 	updateBoulderProgress,
 } from "./agent-store.ts";
-import { formatBoulderStatus, parseResumeArgs, resolveBoulderResume } from "./boulder-resume.ts";
+import { formatBoulderStatus, resolveBoulderResume } from "./boulder-resume.ts";
 import { formatTaskList, formatTaskLogs } from "./format-tasks.ts";
-import { tasksForExecBatch, tasksForFixBatch, tasksForReviewBatch } from "./task-queries.ts";
-import { areExecDepsMet } from "./task-deps.ts";
 import { runFixPhase } from "./fix-run.ts";
 import { makeTaskRunDeps, runExecPhase, runReviewPhase } from "./task-run.ts";
 import { withParallelBatchDisplay, type ParallelExecListener } from "./parallel-batch-ui.ts";
-import { markTaskReviewPass, parseMarkPassArgs, tasksForMarkPassBatch } from "./mark-pass.ts";
 import { isActivePlanComplete, refreshTaskWidget } from "./task-widget.ts";
-import { isExecRunnable, isRunComplete, isRunStillFailing } from "./task-status.ts";
-import { isPlanner, isWorker, type Planner, type Reviewer, type Worker } from "./types.ts";
+import {
+	areExecDepsMet,
+	isExecRunnable,
+	isRunComplete,
+	isRunStillFailing,
+	markTaskReviewPass,
+	tasksForExecBatch,
+	tasksForFixBatch,
+	tasksForMarkPassBatch,
+	tasksForReviewBatch,
+} from "./task-status.ts";
+import {
+	parseExecArgs,
+	parseFixArgs,
+	parseMarkPassArgs,
+	parsePlanArgs,
+	parseResumeArgs,
+	parseReviewArgs,
+	parseRunArgs,
+} from "./command-parser.ts";
+import type { Planner, Reviewer, Worker } from "./types.ts";
 
 function pipelineTaskDeps(
 	pi: ExtensionAPI,
@@ -142,58 +154,7 @@ function cleanPlanNarrative(raw: string): string {
 
 const DIVIDER = "─".repeat(60);
 
-function parsePlanArgs(input: string): { goal: string; applyNow: boolean; planner?: Planner; worker?: Worker } {
-	const parts = input.trim().split(/\s+/).filter(Boolean);
-	const applyNow = parts.includes("--apply");
-	let planner: Planner | undefined;
-	let worker: Worker | undefined;
-	const goalParts: string[] = [];
 
-	for (let i = 0; i < parts.length; i++) {
-		const part = parts[i]!;
-		if (part === "--apply") continue;
-		if (part.startsWith("--planner=")) {
-			const rawPlanner = part.slice("--planner=".length);
-			if (!rawPlanner) throw new Error("--planner requires one of: claude, codex, antigravity");
-			const candidate = rawPlanner.toLowerCase();
-			if (!isPlanner(candidate)) throw new Error(`Unknown planner: ${rawPlanner}`);
-			planner = candidate;
-			continue;
-		}
-		if (part === "--planner") {
-			const rawPlanner = parts[++i];
-			if (!rawPlanner) throw new Error("--planner requires one of: claude, codex, antigravity");
-			const candidate = rawPlanner.toLowerCase();
-			if (!isPlanner(candidate)) throw new Error(`Unknown planner: ${rawPlanner}`);
-			planner = candidate;
-			continue;
-		}
-		if (part.startsWith("--worker=")) {
-			const rawWorker = part.slice("--worker=".length);
-			if (!rawWorker) throw new Error("--worker requires one of: claude, codex, antigravity");
-			const candidate = rawWorker.toLowerCase();
-			if (!isWorker(candidate)) throw new Error(`Unknown worker: ${rawWorker}`);
-			worker = candidate;
-			continue;
-		}
-		if (part === "--worker") {
-			const rawWorker = parts[++i];
-			if (!rawWorker) throw new Error("--worker requires one of: claude, codex, antigravity");
-			const candidate = rawWorker.toLowerCase();
-			if (!isWorker(candidate)) throw new Error(`Unknown worker: ${rawWorker}`);
-			worker = candidate;
-			continue;
-		}
-		goalParts.push(part);
-	}
-
-	return {
-		goal: goalParts.join(" "),
-		applyNow,
-		planner,
-		worker,
-	};
-}
 
 function showPlanDraft(
 	pi: ExtensionAPI,

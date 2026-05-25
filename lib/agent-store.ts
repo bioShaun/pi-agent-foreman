@@ -1,7 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { AGENT_DIR, agentRoot } from "./agent-paths.ts";
-import { validateDependsOn } from "./task-deps.ts";
 import type {
 	AgentBoulder,
 	AgentManifest,
@@ -136,6 +135,18 @@ export function updateBoulderProgress(cwd: string, patch: Partial<AgentBoulder>)
 	const existing = loadBoulder(cwd);
 	if (!existing) return;
 	saveBoulder(cwd, { ...existing, ...patch });
+}
+
+function validateDependsOn(taskIds: string[], dependsOn: string[] | undefined, taskId: string): void {
+	if (!dependsOn?.length) return;
+	for (const depId of dependsOn) {
+		if (depId === taskId) {
+			throw new Error(`Task ${taskId} cannot depend on itself`);
+		}
+		if (!taskIds.includes(depId)) {
+			throw new Error(`Task ${taskId} depends on ${depId}, which is not in the plan`);
+		}
+	}
 }
 
 export function createPlanFromParsed(

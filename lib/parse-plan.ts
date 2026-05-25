@@ -1,4 +1,10 @@
-import { normalizeDependsOn } from "./task-deps.ts";
+function normalizeDependsOn(raw: unknown): string[] | undefined {
+	if (!Array.isArray(raw) || raw.length === 0) return undefined;
+	const ids = raw
+		.filter((v): v is string => typeof v === "string" && /^T\d+$/i.test(v.trim()))
+		.map((v) => v.toUpperCase());
+	return ids.length > 0 ? [...new Set(ids)] : undefined;
+}
 import type { ParsedPlan } from "./types.ts";
 
 export function parsePlanOutput(raw: string, fallbackGoal: string): ParsedPlan {

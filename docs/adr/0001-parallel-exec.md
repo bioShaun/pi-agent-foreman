@@ -33,7 +33,7 @@ We studied [oh-my-claudecode](https://github.com/bioShaun/oh-my-claudecode) (OMC
 
 - Add optional `depends_on: string[]` to `AgentTask` and planner JSON output.
 - Validate at plan creation: IDs must exist in the same plan; no self-edges.
-- **Exec readiness:** task status is exec-runnable (`pending`, `review_fail`, stale `running`) **and** every dep has status ∈ `{ done, review_pass, review_fail }`.
+- **Exec readiness:** task status is exec-runnable (`pending`, stale `running`) **and** every dep has status ∈ `{ done, review_pass, review_fail }`. (Note: `review_fail` tasks are not exec-runnable in batch mode, resolved via `/agent fix` as per ADR-0002).
 - Rationale: dependent work may need upstream code landed; review of the dep can happen before or after the dependent exec, but the dep’s implementation must exist.
 
 ### 2. Parallel exec (`--parallel N`)
