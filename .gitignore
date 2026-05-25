@@ -1,3 +1,4 @@
-.agent/logs/
-.agent/reviews/
+.agent/artifacts/
+.agent/traces/
+.agent/boulder.json
 node_modules/

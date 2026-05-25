@@ -1,17 +1,22 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { AgentManifest, AgentPlan, AgentTask, ParsedPlan, TaskStatus } from "./types.ts";
-
-export const AGENT_DIR = ".agent";
-
-export function agentRoot(cwd: string): string {
-	return join(cwd, AGENT_DIR);
-}
+import { AGENT_DIR, agentRoot } from "./agent-paths.ts";
+import type {
+	AgentBoulder,
+	AgentManifest,
+	AgentPlan,
+	AgentTask,
+	ParsedPlan,
+	TaskRun,
+	TaskStatus,
+} from "./types.ts";
 
 function ensureAgentDirs(cwd: string): void {
 	const root = agentRoot(cwd);
 	mkdirSync(join(root, "plans"), { recursive: true });
 	mkdirSync(join(root, "tasks"), { recursive: true });
+	mkdirSync(join(root, "artifacts"), { recursive: true });
+	mkdirSync(join(root, "traces"), { recursive: true });
 }
 
 export function loadManifest(cwd: string): AgentManifest {
@@ -83,6 +88,32 @@ export function setActivePlan(cwd: string, planId: string): void {
 	saveManifest(cwd, manifest);
 }
 
+export function loadBoulder(cwd: string): AgentBoulder | null {
+	const path = join(agentRoot(cwd), "boulder.json");
+	if (!existsSync(path)) return null;
+	return JSON.parse(readFileSync(path, "utf-8")) as AgentBoulder;
+}
+
+export function saveBoulder(cwd: string, boulder: AgentBoulder): void {
+	ensureAgentDirs(cwd);
+	writeFileSync(join(agentRoot(cwd), "boulder.json"), `${JSON.stringify(boulder, null, 2)}\n`, "utf-8");
+}
+
+export function initBoulderFromPlan(cwd: string, plan: AgentPlan): void {
+	saveBoulder(cwd, {
+		active_plan: join(AGENT_DIR, "plans", `${plan.id}.json`),
+		plan_name: plan.goal.slice(0, 120),
+		started_at: new Date().toISOString(),
+		project_path: cwd,
+	});
+}
+
+export function updateBoulderProgress(cwd: string, patch: Partial<AgentBoulder>): void {
+	const existing = loadBoulder(cwd);
+	if (!existing) return;
+	saveBoulder(cwd, { ...existing, ...patch });
+}
+
 export function createPlanFromParsed(cwd: string, goal: string, raw: string, parsed: ParsedPlan): AgentPlan {
 	ensureAgentDirs(cwd);
 	const planId = nextPlanId(cwd);
@@ -102,6 +133,7 @@ export function createPlanFromParsed(cwd: string, goal: string, raw: string, par
 			status: "pending",
 			prompt: item.prompt,
 			artifacts: {},
+			runs: [],
 			timestamps: { created: new Date().toISOString() },
 		};
 		saveTask(cwd, task);
@@ -118,27 +150,28 @@ export function createPlanFromParsed(cwd: string, goal: string, raw: string, par
 	writeFileSync(join(agentRoot(cwd), "plans", `${planId}.json`), `${JSON.stringify(plan, null, 2)}\n`, "utf-8");
 	writeFileSync(join(agentRoot(cwd), "plans", `${planId}.md`), raw, "utf-8");
 	setActivePlan(cwd, planId);
+	initBoulderFromPlan(cwd, plan);
 	return plan;
 }
 
-export function updateTaskStatus(cwd: string, taskId: string, status: TaskStatus, patch?: Partial<AgentTask>): AgentTask {
+export function updateTaskStatus(
+	cwd: string,
+	taskId: string,
+	status: TaskStatus,
+	patch?: Partial<AgentTask> & { run?: TaskRun },
+): AgentTask {
 	const task = loadTask(cwd, taskId);
 	if (!task) throw new Error(`Task not found: ${taskId}`);
-	const updated: AgentTask = { ...task, ...patch, status };
+	const { run, artifacts, timestamps, ...rest } = patch ?? {};
+	const runs = run ? [...(task.runs ?? []), run] : task.runs;
+	const updated: AgentTask = {
+		...task,
+		...rest,
+		status,
+		runs,
+		artifacts: artifacts ? { ...task.artifacts, ...artifacts } : task.artifacts,
+		timestamps: timestamps ? { ...task.timestamps, ...timestamps } : task.timestamps,
+	};
 	saveTask(cwd, updated);
 	return updated;
-}
-
-export function formatTaskList(tasks: AgentTask[]): string {
-	if (tasks.length === 0) return "No tasks. Run /agent plan <goal> first.";
-	const icon: Record<TaskStatus, string> = {
-		pending: "○",
-		running: "◐",
-		done: "●",
-		review_pass: "✓",
-		review_fail: "✗",
-	};
-	return tasks
-		.map((t) => `${icon[t.status]} ${t.id} [${t.status}] ${t.title}${t.worker ? ` (${t.worker})` : ""}`)
-		.join("\n");
 }

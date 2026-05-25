@@ -1,56 +1,73 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import {
-	buildPlannerPrompt,
-	buildReviewerPrompt,
-	buildWorkerPrompt,
-	readReviewFeedback,
-} from "./agents.ts";
+import { writeFileSync } from "node:fs";
+import { assertRoleAgentAvailable, plannerInvocation } from "./agents.ts";
 import { parsePlanOutput } from "./parse-plan.ts";
 import {
-	assertWorkerAvailable,
 	parseExecArgs,
 	parseReviewArgs,
+	parseSingleExecArgs,
 	runWithLoader,
-	workerCommand,
 } from "./run-command.ts";
+import { artifactPath, createRunId, ensureRunDirs } from "./agent-paths.ts";
 import {
-	agentRoot,
 	createPlanFromParsed,
-	formatTaskList,
 	listTasks,
+	loadBoulder,
 	loadTask,
-	updateTaskStatus,
-} from "./state.ts";
-import type { AgentTask, Worker } from "./types.ts";
+	saveBoulder,
+	updateBoulderProgress,
+} from "./agent-store.ts";
+import { formatBoulderStatus, parseResumeArgs, resolveBoulderResume } from "./boulder-resume.ts";
+import { formatTaskList, formatTaskLogs } from "./format-tasks.ts";
+import { tasksForExecBatch } from "./task-queries.ts";
+import { makeTaskRunDeps, runExecPhase, runReviewPhase } from "./task-run.ts";
+import { refreshTaskWidget } from "./task-widget.ts";
+import { isRunComplete, isRunStillFailing } from "./task-status.ts";
+import type { Worker } from "./types.ts";
 
-function reviewPassed(body: string): boolean {
-	return /\bPASS\b/i.test(body) && !/\bFAIL\b/i.test(body.split("PASS").pop() ?? "");
+function foremanTaskDeps(pi: ExtensionAPI, ctx: ExtensionCommandContext) {
+	return makeTaskRunDeps(pi, ctx, () => refreshTaskWidget(ctx));
 }
 
 export async function runPlan(pi: ExtensionAPI, ctx: ExtensionCommandContext, goal: string): Promise<string> {
 	if (!goal.trim()) throw new Error("Usage: /agent plan <goal>");
 
-	await assertWorkerAvailable(pi, ctx.cwd, "codex");
+	const agent = await assertRoleAgentAvailable(pi, ctx.cwd, "planner");
+	const { invocation } = plannerInvocation(ctx.cwd, goal);
 
-	const result = await runWithLoader(pi, ctx, `Planning: ${goal.slice(0, 60)}…`, "codex", ["exec", "-"], {
-		cwd: ctx.cwd,
-		stdin: buildPlannerPrompt(ctx.cwd, goal),
-		timeoutMs: 30 * 60 * 1000,
-	});
+	const planRunId = createRunId(agent.cli);
+	const result = await runWithLoader(
+		pi,
+		ctx,
+		`Planning: ${goal.slice(0, 60)}…`,
+		invocation.command,
+		invocation.args,
+		{
+			cwd: ctx.cwd,
+			stdin: invocation.stdin,
+			jsonStream: invocation.jsonStream,
+			timeoutMs: 30 * 60 * 1000,
+		},
+	);
 
 	if (result.killed) throw new Error("Planning cancelled");
 	if (result.code !== 0) {
-		throw new Error(result.stderr.trim() || result.stdout.trim() || `codex exec failed (exit ${result.code})`);
+		throw new Error(
+			result.stderr.trim() || result.stdout.trim() || `${agent.cli} exec failed (exit ${result.code})`,
+		);
 	}
 
 	const raw = result.stdout.trim() || result.stderr.trim();
 	const parsed = parsePlanOutput(raw, goal);
 	const plan = createPlanFromParsed(ctx.cwd, parsed.goal, raw, parsed);
 
+	const planArtifact = artifactPath(ctx.cwd, "plan", plan.id, planRunId);
+	ensureRunDirs(planArtifact);
+	writeFileSync(planArtifact, raw, "utf-8");
+
 	return [
 		`Plan ${plan.id} created (${plan.taskIds.length} tasks)`,
+		`Plan artifact: ${planArtifact}`,
 		"",
 		formatTaskList(plan.taskIds.map((id) => loadTask(ctx.cwd, id)!).filter(Boolean)),
 		"",
@@ -63,57 +80,11 @@ async function execTask(
 	ctx: ExtensionCommandContext,
 	taskId: string,
 	worker: Worker,
+	deps = foremanTaskDeps(pi, ctx),
 ): Promise<string> {
-	const task = loadTask(ctx.cwd, taskId);
-	if (!task) throw new Error(`Task not found: ${taskId}`);
-
-	await assertWorkerAvailable(pi, ctx.cwd, worker);
-
-	const reviewFeedback =
-		task.status === "review_fail" ? readReviewFeedback(task.artifacts.review) : undefined;
-	const prompt = buildWorkerPrompt(ctx.cwd, worker, task.prompt, reviewFeedback);
-
-	updateTaskStatus(ctx.cwd, taskId, "running", { worker });
-
-	const { command, args: cmdArgs, stdin } = workerCommand(worker, prompt);
-	const result = await runWithLoader(
-		pi,
-		ctx,
-		`Executing ${taskId} with ${worker}`,
-		command,
-		cmdArgs,
-		{ cwd: ctx.cwd, stdin, timeoutMs: 60 * 60 * 1000 },
-	);
-
-	mkdirSync(join(agentRoot(ctx.cwd), "logs"), { recursive: true });
-	const logPath = join(agentRoot(ctx.cwd), "logs", `${taskId}.log`);
-	const logBody = [result.stdout, result.stderr].filter(Boolean).join("\n--- stderr ---\n");
-	writeFileSync(logPath, logBody, "utf-8");
-
-	if (result.killed) {
-		updateTaskStatus(ctx.cwd, taskId, "pending", {
-			artifacts: { ...task.artifacts, log: logPath },
-		});
-		throw new Error(`Execution cancelled (${taskId})`);
-	}
-
-	if (result.code !== 0) {
-		updateTaskStatus(ctx.cwd, taskId, "pending", {
-			artifacts: { ...task.artifacts, log: logPath },
-		});
-		throw new Error(
-			`Worker ${worker} failed (exit ${result.code}). See ${logPath}\n${result.stderr.trim().slice(0, 500)}`,
-		);
-	}
-
-	updateTaskStatus(ctx.cwd, taskId, "done", {
-		worker,
-		artifacts: { ...task.artifacts, log: logPath },
-		timestamps: { ...task.timestamps, executed: new Date().toISOString() },
-	});
-
-	const retryNote = reviewFeedback ? " (incorporating review feedback)" : "";
-	return [`${taskId} done (${worker})${retryNote}`, `Log: ${logPath}`].join("\n");
+	await assertRoleAgentAvailable(pi, ctx.cwd, "worker", worker);
+	const { summary } = await runExecPhase(deps, taskId, worker);
+	return summary;
 }
 
 export async function runExec(
@@ -122,51 +93,132 @@ export async function runExec(
 	args: string,
 	defaultWorker: Worker = "claude",
 ): Promise<string> {
-	const { taskId, worker } = parseExecArgs(args || `T001 --worker ${defaultWorker}`);
-	const lines = [await execTask(pi, ctx, taskId, worker), "", `Next: /agent review ${taskId}`];
+	const parsed = parseExecArgs(args || `T001 --worker ${defaultWorker}`, defaultWorker);
+	if (parsed.mode === "batch") {
+		return runExecAll(pi, ctx, parsed);
+	}
+	const lines = [await execTask(pi, ctx, parsed.taskId, parsed.worker), "", `Next: /agent review ${parsed.taskId}`];
 	return lines.join("\n");
 }
 
-async function reviewTask(pi: ExtensionAPI, ctx: ExtensionCommandContext, taskId: string): Promise<string> {
-	const task = loadTask(ctx.cwd, taskId);
-	if (!task) throw new Error(`Task not found: ${taskId}`);
+async function runExecAll(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	opts: { worker: Worker; fromTaskId?: string; continueOnError: boolean },
+): Promise<string> {
+	const { plan, runnable, skipped } = tasksForExecBatch(ctx.cwd, { fromTaskId: opts.fromTaskId });
 
-	await assertWorkerAvailable(pi, ctx.cwd, "codex");
-
-	const reviewPrompt = buildReviewerPrompt(ctx.cwd, taskId, task.title);
-	const result = await runWithLoader(pi, ctx, `Reviewing ${taskId}`, "codex", ["review", "-", "--uncommitted"], {
-		cwd: ctx.cwd,
-		stdin: reviewPrompt,
-		timeoutMs: 30 * 60 * 1000,
-	});
-
-	mkdirSync(join(agentRoot(ctx.cwd), "reviews"), { recursive: true });
-	const reviewPath = join(agentRoot(ctx.cwd), "reviews", `${taskId}.md`);
-	const body = result.stdout.trim() || result.stderr.trim();
-	writeFileSync(reviewPath, body, "utf-8");
-
-	if (result.killed) throw new Error("Review cancelled");
-	if (result.code !== 0) {
-		throw new Error(result.stderr.trim() || `codex review failed (exit ${result.code})`);
+	if (runnable.length === 0) {
+		const skippedSummary =
+			skipped.length > 0
+				? `\nSkipped (${skipped.length}): ${skipped.map((t) => `${t.id}[${t.status}]`).join(", ")}`
+				: "";
+		return `No runnable tasks in ${plan.id} (pending or review_fail only).${skippedSummary}\n\nNext: /agent list`;
 	}
 
-	const passed = reviewPassed(body);
-	const status = passed ? "review_pass" : "review_fail";
+	await assertRoleAgentAvailable(pi, ctx.cwd, "worker", opts.worker);
 
-	updateTaskStatus(ctx.cwd, taskId, status, {
-		artifacts: { ...task.artifacts, review: reviewPath },
-		timestamps: { ...task.timestamps, reviewed: new Date().toISOString() },
-	});
+	const batchStartedAt = new Date().toISOString();
+	const boulder = loadBoulder(ctx.cwd);
+	if (boulder) {
+		saveBoulder(ctx.cwd, {
+			...boulder,
+			current_task_id: runnable[0]!.id,
+			batch: {
+				mode: "exec",
+				worker: opts.worker,
+				started_at: batchStartedAt,
+			},
+		});
+	}
 
-	const verdict = passed ? "PASS ✓" : "FAIL ✗";
-	const next = passed ? "" : `\nNext: /agent exec ${taskId} --worker ${task.worker ?? "claude"}  (auto-applies review feedback)`;
-	return [
-		`Review ${taskId}: ${verdict}`,
-		`Report: ${reviewPath}`,
-		next,
+	const sections: string[] = [
+		`## Exec batch — ${plan.id}`,
+		`Worker: ${opts.worker} · Runnable: ${runnable.map((t) => t.id).join(", ")}`,
+	];
+	if (opts.fromTaskId) sections.push(`From: ${opts.fromTaskId}`);
+	if (skipped.length > 0) {
+		sections.push(`Skipped: ${skipped.map((t) => `${t.id}[${t.status}]`).join(", ")}`);
+	}
+
+	let succeeded = 0;
+	let failed = 0;
+	const failures: string[] = [];
+	const batchDeps = foremanTaskDeps(pi, ctx);
+
+	for (const task of runnable) {
+		updateBoulderProgress(ctx.cwd, { current_task_id: task.id });
+		try {
+			sections.push(`### ${task.id}`, await execTask(pi, ctx, task.id, opts.worker, batchDeps));
+			succeeded++;
+		} catch (err) {
+			failed++;
+			const message = err instanceof Error ? err.message : String(err);
+			failures.push(`${task.id}: ${message.split("\n")[0]}`);
+			sections.push(`### ${task.id} — FAILED`, message);
+
+			if (boulder) {
+				saveBoulder(ctx.cwd, {
+					...loadBoulder(ctx.cwd)!,
+					current_task_id: task.id,
+					batch: {
+						mode: "exec",
+						worker: opts.worker,
+						started_at: batchStartedAt,
+						stopped_at: new Date().toISOString(),
+						stopped_reason: message.split("\n")[0] ?? "exec failed",
+					},
+				});
+			}
+
+			if (!opts.continueOnError) {
+				const taskIdx = plan.taskIds.indexOf(task.id);
+				const nextTaskId = taskIdx >= 0 ? plan.taskIds[taskIdx + 1] : undefined;
+				sections.push(
+					"",
+					`Batch stopped at ${task.id} (${succeeded} ok, ${failed} failed).`,
+					`Resume: /agent resume`,
+					`Retry: /agent exec --all --from ${task.id} --worker ${opts.worker}`,
+				);
+				if (nextTaskId) {
+					sections.push(`Skip to ${nextTaskId}: /agent exec --all --from ${nextTaskId} --worker ${opts.worker}`);
+				}
+				sections.push(`Or: /agent exec --all --continue-on-error --worker ${opts.worker}`);
+				return sections.join("\n\n");
+			}
+		}
+	}
+
+	if (boulder && failed === 0) {
+		const latest = loadBoulder(ctx.cwd)!;
+		saveBoulder(ctx.cwd, {
+			...latest,
+			batch: {
+				mode: "exec",
+				worker: opts.worker,
+				started_at: batchStartedAt,
+				stopped_at: new Date().toISOString(),
+			},
+		});
+	}
+
+	sections.push(
 		"",
-		body.slice(0, 2000) + (body.length > 2000 ? "\n…(truncated, see file)" : ""),
-	].join("\n");
+		`Batch complete: ${succeeded} succeeded${failed > 0 ? `, ${failed} failed` : ""}.`,
+	);
+	if (failures.length > 0) {
+		sections.push(`Failures:\n${failures.map((f) => `- ${f}`).join("\n")}`);
+	}
+	sections.push("", "Next: /agent review T00N  (or review each done task individually)");
+
+	return sections.join("\n\n");
+}
+
+async function reviewTask(pi: ExtensionAPI, ctx: ExtensionCommandContext, taskId: string): Promise<string> {
+	await assertRoleAgentAvailable(pi, ctx.cwd, "reviewer");
+	const deps = foremanTaskDeps(pi, ctx);
+	const { summary } = await runReviewPhase(deps, taskId);
+	return summary;
 }
 
 export async function runReview(pi: ExtensionAPI, ctx: ExtensionCommandContext, args: string): Promise<string> {
@@ -180,24 +232,31 @@ export async function runTask(
 	args: string,
 	defaultWorker: Worker = "claude",
 ): Promise<string> {
-	const { taskId, worker } = parseExecArgs(args || `T001 --worker ${defaultWorker}`);
+	const { taskId, worker } = parseSingleExecArgs(args || `T001 --worker ${defaultWorker}`, defaultWorker);
+	const deps = foremanTaskDeps(pi, ctx);
 	const sections: string[] = [`## Run ${taskId} (exec → review)`];
 
-	sections.push("### Exec", await execTask(pi, ctx, taskId, worker));
-	sections.push("### Review", await reviewTask(pi, ctx, taskId));
+	await assertRoleAgentAvailable(pi, ctx.cwd, "worker", worker);
+	await assertRoleAgentAvailable(pi, ctx.cwd, "reviewer");
 
-	let task: AgentTask | null = loadTask(ctx.cwd, taskId);
-	if (task?.status === "review_fail") {
+	let { summary, task } = await runExecPhase(deps, taskId, worker);
+	sections.push("### Exec", summary);
+
+	({ summary, task } = await runReviewPhase(deps, taskId));
+	sections.push("### Review", summary);
+
+	if (isRunStillFailing(task.status)) {
 		sections.push("### Retry exec (review failed)");
-		sections.push(await execTask(pi, ctx, taskId, worker));
+		({ summary } = await runExecPhase(deps, taskId, worker));
+		sections.push(summary);
 		sections.push("### Re-review");
-		sections.push(await reviewTask(pi, ctx, taskId));
-		task = loadTask(ctx.cwd, taskId);
+		({ summary, task } = await runReviewPhase(deps, taskId));
+		sections.push(summary);
 	}
 
-	if (task?.status === "review_pass") {
+	if (isRunComplete(task.status)) {
 		sections.push("", `✓ ${taskId} complete`);
-	} else if (task?.status === "review_fail") {
+	} else if (isRunStillFailing(task.status)) {
 		sections.push("", `✗ ${taskId} still failing review — check ${task.artifacts.review}`);
 	}
 
@@ -206,6 +265,44 @@ export async function runTask(
 
 export function runList(ctx: ExtensionCommandContext): string {
 	return formatTaskList(listTasks(ctx.cwd));
+}
+
+export function runLogs(ctx: ExtensionCommandContext, args: string): string {
+	const taskId = args.trim().match(/^(T\d+)/i)?.[1]?.toUpperCase();
+	if (!taskId) throw new Error("Usage: /agent logs T001");
+	return formatTaskLogs(ctx.cwd, taskId);
+}
+
+export async function runResume(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	args: string,
+): Promise<string> {
+	const trimmed = args.trim();
+	if (trimmed === "status" || trimmed === "show") {
+		return formatBoulderStatus(ctx.cwd);
+	}
+
+	const { continueOnError } = parseResumeArgs(args);
+	const resolved = resolveBoulderResume(ctx.cwd);
+	if (!resolved.ok) throw new Error(resolved.message);
+
+	const { request } = resolved;
+	const header = [
+		`## Resume — ${request.planName}`,
+		`From ${request.fromTaskId} · Worker: ${request.worker}`,
+		request.stoppedReason ? `Previous stop: ${request.stoppedReason}` : "",
+	]
+		.filter(Boolean)
+		.join("\n");
+
+	const body = await runExecAll(pi, ctx, {
+		worker: request.worker,
+		fromTaskId: request.fromTaskId,
+		continueOnError,
+	});
+
+	return `${header}\n\n${body}`;
 }
 
 export async function dispatchAgentCommand(
@@ -220,8 +317,13 @@ export async function dispatchAgentCommand(
 			"",
 			"/agent plan <goal>                   Plan with Codex",
 			"/agent run T001 [--worker claude]    Exec + review (+ 1 retry if fail)",
-			"/agent exec T001 [--worker claude]   Execute task",
+			"/agent exec T001 [--worker claude]   Execute one task",
+			"/agent exec --all [--worker claude]  Exec all pending/review_fail in active plan",
+			"                                     [--from T003] [--continue-on-error]",
+			"/agent resume                        Resume last stopped exec batch (boulder.json)",
+			"                                     [--continue-on-error] · resume status",
 			"/agent review T001                   Codex review",
+			"/agent logs T001                     Run history + artifact paths",
 			"/agent list                          Show tasks",
 			"",
 			"Roles: agents/*.md (override via .pi/agents/)",
@@ -241,10 +343,14 @@ export async function dispatchAgentCommand(
 			return runExec(pi, ctx, rest);
 		case "review":
 			return runReview(pi, ctx, rest);
+		case "resume":
+			return runResume(pi, ctx, rest);
 		case "list":
 		case "status":
 		case "tasks":
 			return runList(ctx);
+		case "logs":
+			return runLogs(ctx, rest);
 		default:
 			throw new Error(`Unknown subcommand: ${sub}. Try /agent help`);
 	}

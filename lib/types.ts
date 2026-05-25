@@ -1,6 +1,42 @@
 export type TaskStatus = "pending" | "running" | "done" | "review_pass" | "review_fail";
 
-export type Worker = "claude" | "codex" | "antigravity";
+export const WORKERS = ["claude", "codex", "antigravity"] as const;
+
+export type Worker = (typeof WORKERS)[number];
+
+export function isWorker(value: string): value is Worker {
+	return (WORKERS as readonly string[]).includes(value);
+}
+
+export type RunPhase = "exec" | "review" | "plan";
+
+export interface TaskRun {
+	runId: string;
+	phase: RunPhase;
+	worker?: Worker | "codex";
+	startedAt: string;
+	endedAt?: string;
+	exitCode?: number;
+	paths: {
+		output?: string;
+		live?: string;
+	};
+}
+
+export interface AgentBoulder {
+	active_plan: string;
+	plan_name: string;
+	started_at: string;
+	project_path: string;
+	current_task_id?: string;
+	batch?: {
+		mode: "exec";
+		worker: string;
+		started_at: string;
+		stopped_at?: string;
+		stopped_reason?: string;
+	};
+}
 
 export interface AgentManifest {
 	planCounter: number;
@@ -28,7 +64,9 @@ export interface AgentTask {
 		log?: string;
 		review?: string;
 		branch?: string;
+		liveTrace?: string;
 	};
+	runs?: TaskRun[];
 	timestamps: {
 		created: string;
 		executed?: string;

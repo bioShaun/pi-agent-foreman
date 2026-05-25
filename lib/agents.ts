@@ -2,6 +2,10 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { buildRoleInvocation, type RoleInvocation } from "./role-invoke.ts";
+import { cliBinCandidates } from "./cli-resolve.ts";
+import { which } from "./run-command.ts";
 import type { Worker } from "./types.ts";
 
 export type AgentRole = "planner" | "worker" | "reviewer";
@@ -10,6 +14,8 @@ export interface RoleAgent {
 	name: string;
 	role: AgentRole;
 	cli: string;
+	/** Executable on PATH; defaults from cli (e.g. antigravity → agy). */
+	bin?: string;
 	worker?: Worker;
 	description: string;
 	systemPrompt: string;
@@ -43,6 +49,7 @@ function loadAgentsFromDir(dir: string, source: "package" | "project"): RoleAgen
 			name: frontmatter.name ?? entry.name.replace(/\.md$/, ""),
 			role,
 			cli: frontmatter.cli,
+			bin: frontmatter.bin,
 			worker: frontmatter.worker as Worker | undefined,
 			description: frontmatter.description ?? "",
 			systemPrompt: body.trim(),
@@ -90,13 +97,15 @@ export function getAgent(cwd: string, role: AgentRole, worker?: Worker): RoleAge
 	return match;
 }
 
-export function buildPlannerPrompt(cwd: string, goal: string): string {
-	const agent = getAgent(cwd, "planner");
+export function buildPlannerPrompt(agent: RoleAgent, goal: string): string {
 	return `${agent.systemPrompt}\n\n---\n\nGoal: ${goal}`;
 }
 
-export function buildWorkerPrompt(cwd: string, worker: Worker, taskPrompt: string, reviewFeedback?: string): string {
-	const agent = getAgent(cwd, "worker", worker);
+export function buildWorkerPrompt(
+	agent: RoleAgent,
+	taskPrompt: string,
+	reviewFeedback?: string,
+): string {
 	let prompt = `${agent.systemPrompt}\n\n---\n\n## Task\n\n${taskPrompt}`;
 	if (reviewFeedback?.trim()) {
 		prompt += `\n\n---\n\n## Previous review feedback\n\n${reviewFeedback.trim()}\n\nAddress the feedback and complete the task.`;
@@ -104,8 +113,7 @@ export function buildWorkerPrompt(cwd: string, worker: Worker, taskPrompt: strin
 	return prompt;
 }
 
-export function buildReviewerPrompt(cwd: string, taskId: string, title: string): string {
-	const agent = getAgent(cwd, "reviewer");
+export function buildReviewerPrompt(agent: RoleAgent, taskId: string, title: string): string {
 	return `${agent.systemPrompt}\n\n---\n\nTask ${taskId}: ${title}`;
 }
 
@@ -117,3 +125,52 @@ export function readReviewFeedback(reviewPath: string | undefined): string | und
 		return undefined;
 	}
 }
+
+export async function assertRoleAgentAvailable(
+	pi: ExtensionAPI,
+	cwd: string,
+	role: AgentRole,
+	worker?: Worker,
+): Promise<RoleAgent> {
+	const agent = getAgent(cwd, role, worker);
+	const candidates = cliBinCandidates(agent.cli, agent.bin);
+	for (const bin of candidates) {
+		if (await which(pi, cwd, bin)) return agent;
+	}
+	throw new Error(
+		`${candidates.join(" or ")} CLI not found in PATH (${agent.name}, ${agent.source}). Install Antigravity CLI (agy) or override .pi/agents/`,
+	);
+}
+
+export function plannerInvocation(cwd: string, goal: string): { agent: RoleAgent; invocation: RoleInvocation } {
+	const agent = getAgent(cwd, "planner");
+	const prompt = buildPlannerPrompt(agent, goal);
+	return { agent, invocation: buildRoleInvocation(agent, { mode: "prompt", prompt }) };
+}
+
+export function workerInvocation(
+	cwd: string,
+	worker: Worker,
+	taskPrompt: string,
+	reviewFeedback?: string,
+): { agent: RoleAgent; invocation: RoleInvocation } {
+	const agent = getAgent(cwd, "worker", worker);
+	const prompt = buildWorkerPrompt(agent, taskPrompt, reviewFeedback);
+	return { agent, invocation: buildRoleInvocation(agent, { mode: "prompt", prompt }) };
+}
+
+export function reviewerInvocation(
+	cwd: string,
+	taskId: string,
+	title: string,
+): { agent: RoleAgent; invocation: RoleInvocation } {
+	const agent = getAgent(cwd, "reviewer");
+	const criteria = buildReviewerPrompt(agent, taskId, title).replace(/\s+/g, " ").slice(0, 400);
+	const reviewTitle = `${taskId}: ${title} — ${criteria}`;
+	return {
+		agent,
+		invocation: buildRoleInvocation(agent, { mode: "review-title", title: reviewTitle }),
+	};
+}
+
+export type { RoleInvocation } from "./role-invoke.ts";

@@ -1,21 +1,35 @@
-import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { BorderedLoader } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
+import { Container, matchesKey, Spacer, Text } from "@earendil-works/pi-tui";
+import { watchAntigravityProgress } from "./antigravity-progress.ts";
+import { shortenDisplayPath } from "./format-display.ts";
+import { appendLiveLog, ensureLiveOutputSection, initLiveLog } from "./live-log.ts";
+import {
+	buildLoaderText,
+	isLoaderProgressLine,
+	loaderFallback,
+	pushDisplayLine,
+	usesStructuredProgress,
+} from "./run-display.ts";
+import { spawnProcess, type RunResult } from "./spawn-process.ts";
 import type { Worker } from "./types.ts";
+import { isWorker } from "./types.ts";
 
-export interface RunResult {
-	code: number;
-	stdout: string;
-	stderr: string;
-	killed: boolean;
+function parseWorker(raw: string, defaultWorker: Worker): Worker {
+	const worker = raw.toLowerCase();
+	if (!isWorker(worker)) throw new Error(`Unknown worker: ${worker}`);
+	return worker;
 }
 
-const TAIL_LINES = 8;
+export type { RunResult } from "./spawn-process.ts";
 
-function tail(text: string, lines = TAIL_LINES): string {
-	const parts = text.trim().split("\n");
-	return parts.slice(-lines).join("\n");
+export interface RunWithLoaderOptions {
+	cwd?: string;
+	stdin?: string;
+	timeoutMs?: number;
+	jsonStream?: "claude" | "codex";
+	antigravityProgress?: boolean;
+	liveLogPath?: string;
 }
 
 export async function runWithLoader(
@@ -24,123 +38,147 @@ export async function runWithLoader(
 	label: string,
 	command: string,
 	args: string[],
-	options?: { cwd?: string; stdin?: string; timeoutMs?: number },
+	options?: RunWithLoaderOptions,
 ): Promise<RunResult> {
 	if (!ctx.hasUI) {
 		return pi.exec(command, args, {
 			cwd: options?.cwd ?? ctx.cwd,
-			timeout: options?.timeoutMs ?? 30 * 60 * 1000,
+			timeoutMs: options?.timeoutMs ?? 30 * 60 * 1000,
 		});
 	}
 
+	if (options?.liveLogPath) {
+		initLiveLog(options.liveLogPath, label);
+	}
+
+	const cwd = options?.cwd ?? ctx.cwd;
+	const liveHint = options?.liveLogPath
+		? shortenDisplayPath(options.liveLogPath, cwd)
+		: ".agent/traces/T001/<runId>.live.log";
+
+	const structured = usesStructuredProgress(options);
+
 	return ctx.ui.custom<RunResult>((tui, theme, _kb, done) => {
-		const loader = new BorderedLoader(tui, theme, label, { cancellable: true });
-		const output = new Text("", 0, 0);
-		loader.addChild(output);
+		const container = new Container();
+		const border = new DynamicBorder((s: string) => theme.fg("border", s));
+		const output = new Text("", 1, 0);
 
-		let stdout = "";
-		let stderr = "";
-		let killed = false;
+		container.addChild(border);
+		container.addChild(output);
+		container.addChild(new Spacer(1));
+		container.addChild(new Text(theme.fg("dim", `Esc cancel · tail -f ${liveHint}`), 1, 0));
+		container.addChild(border);
 
-		const proc = spawn(command, args, {
-			cwd: options?.cwd ?? ctx.cwd,
-			shell: false,
-			stdio: ["pipe", "pipe", "pipe"],
-		});
-
-		const timeout = options?.timeoutMs
-			? setTimeout(() => {
-					killed = true;
-					proc.kill("SIGTERM");
-				}, options.timeoutMs)
-			: undefined;
-
-		loader.onAbort = () => {
-			killed = true;
-			proc.kill("SIGTERM");
+		const redraw = () => {
+			container.invalidate();
+			tui.requestRender();
 		};
 
-		if (options?.stdin !== undefined) {
-			proc.stdin?.write(options.stdin);
-			proc.stdin?.end();
-		} else {
-			proc.stdin?.end();
-		}
+		const recentLines: string[] = [];
+		const started = Date.now();
+		let outputSectionOpen = !structured;
+		const fallback = loaderFallback(options);
 
 		const refresh = () => {
-			const combined = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
-			const preview = tail(combined) || "(waiting for output…)";
-			output.setText(theme.fg("muted", preview));
+			output.setText(theme.fg("muted", buildLoaderText(label, Date.now() - started, recentLines, fallback)));
+			redraw();
 		};
 
-		proc.stdout?.on("data", (chunk: Buffer) => {
-			stdout += chunk.toString();
+		refresh();
+
+		const onProgressLine = (line: string, filterStructured = structured) => {
+			if (filterStructured && !isLoaderProgressLine(line)) return;
+			pushDisplayLine(recentLines, line);
+			appendLiveLog(options?.liveLogPath, "progress", line);
 			refresh();
-		});
-		proc.stderr?.on("data", (chunk: Buffer) => {
-			stderr += chunk.toString();
-			refresh();
+		};
+
+		const onOutputLine = (line: string) => {
+			if (!outputSectionOpen) {
+				ensureLiveOutputSection(options?.liveLogPath);
+				outputSectionOpen = true;
+			}
+			appendLiveLog(options?.liveLogPath, "output", line);
+		};
+
+		const agyWatcher = options?.antigravityProgress
+			? watchAntigravityProgress(started, (line) => onProgressLine(line))
+			: undefined;
+
+		const handle = spawnProcess({
+			command,
+			args,
+			cwd: options?.cwd ?? ctx.cwd,
+			stdin: options?.stdin,
+			timeoutMs: options?.timeoutMs,
+			jsonStream: options?.jsonStream,
+			mergeStderr: options?.antigravityProgress,
+			onProgressLine: (line) => onProgressLine(line, structured),
+			onOutputLine: structured ? onOutputLine : undefined,
 		});
 
-		proc.on("close", (code) => {
-			if (timeout) clearTimeout(timeout);
-			done({ code: code ?? 1, stdout, stderr, killed });
+		const elapsedTimer = setInterval(refresh, 1000);
+
+		void handle.result.then((result) => {
+			clearInterval(elapsedTimer);
+			agyWatcher?.stop();
+			done(result);
 		});
 
-		proc.on("error", (err) => {
-			if (timeout) clearTimeout(timeout);
-			stderr += `\n${err.message}`;
-			done({ code: 1, stdout, stderr, killed });
-		});
-
-		return loader;
+		return {
+			render: (width: number) => container.render(width),
+			invalidate: redraw,
+			handleInput: (data: string) => {
+				if (matchesKey(data, "escape")) {
+					agyWatcher?.stop();
+					handle.kill();
+				}
+			},
+		};
 	});
 }
 
 export async function which(pi: ExtensionAPI, cwd: string, bin: string): Promise<boolean> {
-	const result = await pi.exec("bash", ["-lc", `command -v ${bin}`], { cwd, timeout: 5000 });
+	if (!/^[A-Za-z0-9._+-]+$/.test(bin)) return false;
+	const result = await pi.exec("bash", ["-lc", `command -v -- ${JSON.stringify(bin)}`], { cwd, timeout: 5000 });
 	return result.code === 0 && result.stdout.trim().length > 0;
 }
 
-export function workerCommand(worker: Worker, prompt: string): { command: string; args: string[]; stdin?: string } {
-	switch (worker) {
-		case "claude":
-			return {
-				command: "claude",
-				args: ["-p", prompt, "--dangerously-skip-permissions"],
-			};
-		case "codex":
-			return {
-				command: "codex",
-				args: ["exec", prompt],
-			};
-		case "antigravity":
-			return {
-				command: "antigravity",
-				args: ["-p", prompt],
-			};
+export function parseExecArgs(
+	args: string,
+	defaultWorker: Worker = "claude",
+): { mode: "single"; taskId: string; worker: Worker } | { mode: "batch"; worker: Worker; fromTaskId?: string; continueOnError: boolean } {
+	const trimmed = args.trim();
+	if (!trimmed) {
+		throw new Error("Usage: /agent exec T001 [--worker claude|codex|antigravity] | /agent exec --all [--worker claude] [--from T003] [--continue-on-error]");
 	}
+
+	if (/^--all\b/i.test(trimmed)) {
+		const workerMatch = trimmed.match(/--worker\s+(\w+)/i);
+		const worker = parseWorker(workerMatch?.[1]?.toLowerCase() ?? defaultWorker, defaultWorker);
+		const fromMatch = trimmed.match(/--from\s+(T\d+)/i);
+		return {
+			mode: "batch",
+			worker,
+			fromTaskId: fromMatch?.[1]?.toUpperCase(),
+			continueOnError: /--continue-on-error\b/i.test(trimmed),
+		};
+	}
+
+	const match = trimmed.match(/^(T\d+)\s*(?:--worker\s+(\w+))?/i);
+	if (!match) {
+		throw new Error("Usage: /agent exec T001 [--worker claude|codex|antigravity] | /agent exec --all [--worker claude] [--from T003] [--continue-on-error]");
+	}
+	const worker = parseWorker(match[2]?.toLowerCase() ?? defaultWorker, defaultWorker);
+	return { mode: "single", taskId: match[1].toUpperCase(), worker };
 }
 
-export async function assertWorkerAvailable(
-	pi: ExtensionAPI,
-	cwd: string,
-	worker: Worker,
-): Promise<void> {
-	const bin = worker === "codex" ? "codex" : worker === "claude" ? "claude" : "antigravity";
-	if (!(await which(pi, cwd, bin))) {
-		throw new Error(`${bin} CLI not found in PATH. Install it or pick another --worker.`);
+export function parseSingleExecArgs(args: string, defaultWorker: Worker = "claude"): { taskId: string; worker: Worker } {
+	const parsed = parseExecArgs(args, defaultWorker);
+	if (parsed.mode !== "single") {
+		throw new Error("This command requires a single task id (T001). Use /agent exec --all for batch execution.");
 	}
-}
-
-export function parseExecArgs(args: string): { taskId: string; worker: Worker } {
-	const match = args.trim().match(/^(T\d+)\s*(?:--worker\s+(\w+))?/i);
-	if (!match) throw new Error("Usage: /agent exec T001 [--worker claude|codex|antigravity]");
-	const worker = (match[2]?.toLowerCase() ?? "claude") as Worker;
-	if (!["claude", "codex", "antigravity"].includes(worker)) {
-		throw new Error(`Unknown worker: ${worker}`);
-	}
-	return { taskId: match[1].toUpperCase(), worker };
+	return parsed;
 }
 
 export function parseReviewArgs(args: string): string {

@@ -11,34 +11,24 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { dispatchAgentCommand } from "./lib/commands.ts";
-import { listTasks, loadManifest } from "./lib/state.ts";
+import { refreshTaskWidget } from "./lib/task-widget.ts";
 
-const SUBCOMMANDS = ["plan", "run", "exec", "review", "list", "status", "tasks", "help"];
+const SUBCOMMANDS = ["plan", "run", "exec", "review", "resume", "list", "logs", "status", "tasks", "help"];
 
-function taskWidgetLines(cwd: string): string[] | undefined {
-	const tasks = listTasks(cwd);
-	if (tasks.length === 0) return undefined;
-	const manifest = loadManifest(cwd);
-	const header = manifest.activePlanId ? `📋 ${manifest.activePlanId}` : "📋 agent tasks";
-	const lines = tasks.slice(0, 8).map((t) => {
-		const icon =
-			t.status === "review_pass"
-				? "✓"
-				: t.status === "review_fail"
-					? "✗"
-					: t.status === "running"
-						? "◐"
-						: t.status === "done"
-							? "●"
-							: "○";
-		return `${icon} ${t.id} ${t.title.slice(0, 40)}`;
-	});
-	return [header, ...lines];
+function agentNotifySummary(summary: string): string {
+	const batchStopped = summary.match(/Batch stopped at T\d+[^\n]*/);
+	if (batchStopped) return batchStopped[0]!;
+	const resumeHeader = summary.match(/## Resume —[^\n]*/);
+	if (resumeHeader) return "Resuming exec batch…";
+	const batchComplete = summary.match(/Batch complete: [^\n]+/);
+	if (batchComplete) return batchComplete[0]!;
+	const line = summary.split("\n").find((l) => l.trim() && !l.startsWith("#"));
+	return line?.trim() ?? "Done";
 }
 
 export default function agentForemanExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
-		ctx.ui.setWidget("agent-foreman", taskWidgetLines(ctx.cwd));
+		refreshTaskWidget(ctx);
 	});
 
 	pi.registerCommand("agent", {
@@ -50,12 +40,18 @@ export default function agentForemanExtension(pi: ExtensionAPI): void {
 				return filtered.map((s) => ({ value: s, label: s }));
 			}
 			const sub = parts[0]?.toLowerCase();
-			if ((sub === "exec" || sub === "review" || sub === "run") && parts.length === 2) {
+			if ((sub === "exec" || sub === "review" || sub === "run" || sub === "logs") && parts.length === 2) {
 				// Task IDs — we can't access cwd here easily; offer pattern
 				return [{ value: "T001", label: "T001" }];
 			}
 			if (sub === "exec" && parts.length >= 2 && prefix.endsWith(" --worker ")) {
 				return ["claude", "codex", "antigravity"].map((w) => ({ value: w, label: w }));
+			}
+			if (sub === "exec" && parts.length === 1 && !prefix.includes(" ")) {
+				return [
+					{ value: "--all", label: "exec all runnable tasks in active plan" },
+					{ value: "T001", label: "T001" },
+				];
 			}
 			return null;
 		},
@@ -72,11 +68,20 @@ export default function agentForemanExtension(pi: ExtensionAPI): void {
 					{ triggerTurn: false },
 				);
 
-				ctx.ui.setWidget("agent-foreman", taskWidgetLines(ctx.cwd));
-				ctx.ui.notify(summary.split("\n")[0] ?? "Done", "info");
+				refreshTaskWidget(ctx);
+				ctx.ui.notify(agentNotifySummary(summary), "info");
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
-				ctx.ui.notify(message, "error");
+				pi.sendMessage(
+					{
+						customType: "agent-foreman-result",
+						content: message,
+						display: true,
+					},
+					{ triggerTurn: false },
+				);
+				refreshTaskWidget(ctx);
+				ctx.ui.notify(message.split("\n")[0] ?? message, "error");
 			}
 		},
 	});
