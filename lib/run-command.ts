@@ -16,8 +16,8 @@ import {
 	usesStructuredProgress,
 } from "./run-display.ts";
 import { spawnProcess, type RunResult } from "./spawn-process.ts";
-import type { Reviewer, Worker } from "./types.ts";
-import { isReviewer, isWorker } from "./types.ts";
+import type { Fixer, Reviewer, Worker } from "./types.ts";
+import { isFixer, isReviewer, isWorker } from "./types.ts";
 
 function parseReviewer(raw: string, defaultReviewer: Reviewer): Reviewer {
 	const reviewer = raw.toLowerCase();
@@ -29,6 +29,12 @@ function parseWorker(raw: string, defaultWorker: Worker): Worker {
 	const worker = raw.toLowerCase();
 	if (!isWorker(worker)) throw new Error(`Unknown worker: ${worker}`);
 	return worker;
+}
+
+function parseFixer(raw: string): Fixer {
+	const fixer = raw.toLowerCase();
+	if (!isFixer(fixer)) throw new Error(`Unknown fixer: ${fixer}`);
+	return fixer;
 }
 
 export type { RunResult } from "./spawn-process.ts";
@@ -315,18 +321,17 @@ export function parseReviewArgs(
 	args: string,
 	defaultReviewer: Reviewer = "codex",
 ):
-	| { mode: "single"; taskId: string; reviewer: Reviewer; fix: boolean }
-	| { mode: "batch"; reviewer: Reviewer; fromTaskId?: string; continueOnError: boolean; fix: boolean } {
+	| { mode: "single"; taskId: string; reviewer: Reviewer }
+	| { mode: "batch"; reviewer: Reviewer; fromTaskId?: string; continueOnError: boolean } {
 	const trimmed = args.trim();
 	if (!trimmed) {
 		throw new Error(
-			"Usage: /agent review T001 [--reviewer claude|codex] [--fix] | /agent review --all [--reviewer claude|codex] [--fix] [--from T003] [--continue-on-error]",
+			"Usage: /agent review T001 [--reviewer claude|codex] | /agent review --all [--reviewer claude|codex] [--from T003] [--continue-on-error]",
 		);
 	}
 
 	const reviewerMatch = trimmed.match(/--reviewer\s+(\w+)/i);
 	const reviewer = parseReviewer(reviewerMatch?.[1]?.toLowerCase() ?? defaultReviewer, defaultReviewer);
-	const fix = /--fix\b/i.test(trimmed);
 
 	if (/^--all\b/i.test(trimmed)) {
 		const fromMatch = trimmed.match(/--from\s+(T\d+)/i);
@@ -335,17 +340,30 @@ export function parseReviewArgs(
 			reviewer,
 			fromTaskId: fromMatch?.[1]?.toUpperCase(),
 			continueOnError: /--continue-on-error\b/i.test(trimmed),
-			fix,
 		};
 	}
 
 	const taskId = trimmed.match(/^(T\d+)/i)?.[1]?.toUpperCase();
 	if (!taskId) {
 		throw new Error(
-			"Usage: /agent review T001 [--reviewer claude|codex] [--fix] | /agent review --all [--reviewer claude|codex] [--fix] [--from T003] [--continue-on-error]",
+			"Usage: /agent review T001 [--reviewer claude|codex] | /agent review --all [--reviewer claude|codex] [--from T003] [--continue-on-error]",
 		);
 	}
-	return { mode: "single", taskId, reviewer, fix };
+	return { mode: "single", taskId, reviewer };
+}
+
+export function parseFixArgs(
+	args: string,
+	defaultFixer: Fixer = "claude",
+): { fixer: Fixer; fromTaskId?: string } {
+	const trimmed = args.trim();
+	const fixerMatch = trimmed.match(/--fixer\s+(\w+)/i);
+	const fixer = fixerMatch ? parseFixer(fixerMatch[1]!.toLowerCase()) : defaultFixer;
+	const fromMatch = trimmed.match(/--from\s+(T\d+)/i);
+	return {
+		fixer,
+		fromTaskId: fromMatch?.[1]?.toUpperCase(),
+	};
 }
 
 export function parseRunArgs(

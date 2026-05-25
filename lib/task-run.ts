@@ -1,6 +1,6 @@
 import { writeFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { reviewerFixInvocation, reviewerInvocation, workerInvocation } from "./agents.ts";
+import { reviewerInvocation, workerInvocation } from "./agents.ts";
 import { watchAntigravityProgress } from "./antigravity-progress.ts";
 import { appendLiveLog, initLiveLog } from "./live-log.ts";
 import { spawnProcess, type RunResult } from "./spawn-process.ts";
@@ -14,21 +14,16 @@ import { writePromptSnapshot } from "./prompt-persistence.ts";
 import {
 	extractReviewVerdictFromBody,
 	formatFindingsSummary,
-	formatReviewLoaderContext,
 	formatReviewPhaseLoaderContext,
-	loadReviewContext,
-	type ReviewContext,
 	reviewPassed,
-	shouldIncorporateReviewOnExec,
 	writeReviewVerdictJson,
 } from "./review-verdict.ts";
 import {
-	execHintAfterReviewFail,
 	execRevertStatus,
 	formatReviewVerdict,
 	reviewStatusFromVerdict,
 } from "./task-status.ts";
-import type { AgentTask, Reviewer, ReviewVerdictPayload, TaskRun, TaskStatus, Worker } from "./types.ts";
+import type { AgentTask, Reviewer, TaskRun, TaskStatus, Worker } from "./types.ts";
 
 export interface InvokeSpec {
 	label: string;
@@ -119,31 +114,6 @@ export function makeSilentInvokeAdapter(_pi: ExtensionAPI, ctx: ExtensionCommand
 	};
 }
 
-function resolveExecReviewLoad(
-	task: AgentTask,
-	taskId: string,
-): { incorporatingReview: boolean; reviewContext?: ReviewContext; loaderContext?: string[] } {
-	if (!shouldIncorporateReviewOnExec(task)) {
-		return { incorporatingReview: false };
-	}
-
-	const reviewContext = loadReviewContext(task.artifacts.review, task.artifacts.reviewVerdict, taskId);
-	if (reviewContext) {
-		return {
-			incorporatingReview: true,
-			reviewContext,
-			loaderContext: formatReviewLoaderContext(reviewContext),
-		};
-	}
-
-	const hint = task.artifacts.reviewVerdict
-		? `↳ review_fail · could not load review (missing ${task.artifacts.reviewVerdict})`
-		: task.artifacts.review
-			? `↳ review_fail · could not read ${task.artifacts.review}`
-			: "↳ review_fail · no review artifact on task";
-	return { incorporatingReview: true, loaderContext: [hint] };
-}
-
 function workerFailureDetail(result: { stdout: string; stderr: string }, logBody: string): string {
 	return result.stderr.trim() || tailLines(result.stdout) || tailLines(logBody);
 }
@@ -161,9 +131,8 @@ export async function runExecPhase(
 	}
 
 	const priorStatus = task.status;
-	const { incorporatingReview, reviewContext, loaderContext } = resolveExecReviewLoad(task, taskId);
-	const { agent, prompt, invocation } = workerInvocation(deps.cwd, worker, task.prompt, reviewContext);
-	const revertStatus = execRevertStatus(priorStatus, incorporatingReview);
+	const { agent, prompt, invocation } = workerInvocation(deps.cwd, worker, task.prompt);
+	const revertStatus = execRevertStatus(priorStatus);
 
 	const runId = createRunId(worker);
 	const startedAt = new Date().toISOString();
@@ -174,9 +143,7 @@ export async function runExecPhase(
 	deps.onExecStarted?.({
 		taskId,
 		livePath: live,
-		label: incorporatingReview
-			? `Executing ${taskId} with ${agent.cli} · review retry`
-			: `Executing ${taskId} with ${agent.cli}`,
+		label: `Executing ${taskId} with ${agent.cli}`,
 	});
 
 	const promptPath = writePromptSnapshot(deps.cwd, {
@@ -185,24 +152,19 @@ export async function runExecPhase(
 		run_id: runId,
 		cli: agent.cli,
 		worker,
-		incorporated_review_run_id: reviewContext?.runId,
-		finding_count: reviewContext?.payload?.findings.length,
 	}, prompt);
 
 	patchTaskStatus(deps, taskId, "running", { worker });
 
 	try {
 		const result = await deps.invoke({
-			label: incorporatingReview
-				? `Executing ${taskId} with ${agent.cli} · review retry`
-				: `Executing ${taskId} with ${agent.cli}`,
+			label: `Executing ${taskId} with ${agent.cli}`,
 			command: invocation.command,
 			args: invocation.args,
 			stdin: invocation.stdin,
 			jsonStream: invocation.jsonStream,
 			antigravityProgress: invocation.antigravityProgress,
 			liveLogPath: live,
-			loaderContext,
 			timeoutMs: 60 * 60 * 1000,
 		});
 
@@ -263,11 +225,8 @@ export async function runExecPhase(
 			run,
 		});
 
-		const retryNote = incorporatingReview
-			? ` (from review ${reviewContext?.runId ?? "unknown"}${reviewContext?.payload ? `, ${reviewContext.payload.findings.length} finding(s)` : ""})`
-			: "";
 		const summary = [
-			`${taskId} done (${agent.cli})${retryNote}`,
+			`${taskId} done (${agent.cli})`,
 			gateLine,
 			`Prompt: ${promptPath}`,
 			`Log: ${logPath}`,
@@ -358,14 +317,12 @@ export async function runReviewPhase(
 
 	const verdict = formatReviewVerdict(passed);
 	const findingsLine = payload ? formatFindingsSummary(payload) : "";
-	const next = passed ? "" : execHintAfterReviewFail(taskId, task.worker);
 	const summary = [
 		`Review ${taskId}: ${verdict}`,
 		`Report: ${reviewPath}`,
 		payload ? `Verdict: ${verdictPath}` : "",
 		`Prompt: ${promptPath}`,
 		findingsLine,
-		next,
 		"",
 		body.slice(0, 2000) + (body.length > 2000 ? "\n…(truncated, see file)" : ""),
 	]
@@ -373,82 +330,4 @@ export async function runReviewPhase(
 		.join("\n");
 
 	return { summary, task: updated, passed };
-}
-
-export async function runReviewFixPhase(
-	deps: TaskRunDeps,
-	taskId: string,
-	reviewer: Reviewer | undefined,
-	payload: ReviewVerdictPayload,
-): Promise<{ summary: string; logPath: string }> {
-	const task = requireTask(deps.cwd, taskId);
-
-	const { agent, prompt, invocation } = reviewerFixInvocation(
-		deps.cwd,
-		taskId,
-		task.title,
-		reviewer,
-		payload,
-	);
-
-	const runId = createRunId(agent.cli);
-	const startedAt = new Date().toISOString();
-	const logPath = artifactPath(deps.cwd, "review_fix", taskId, runId);
-	const live = tracePath(deps.cwd, taskId, runId);
-	ensureRunDirs(logPath, live);
-
-	const promptPath = writePromptSnapshot(deps.cwd, {
-		task_id: taskId,
-		phase: "review_fix",
-		run_id: runId,
-		cli: agent.cli,
-		reviewer: reviewer ?? agent.reviewer ?? agent.cli,
-		incorporated_review_run_id: payload.review_run_id,
-		finding_count: payload.findings.length,
-	}, prompt);
-
-	const result = await deps.invoke({
-		label: `Review-fix ${taskId} with ${agent.cli}`,
-		command: invocation.command,
-		args: invocation.args,
-		stdin: invocation.stdin,
-		jsonStream: invocation.jsonStream,
-		antigravityProgress: invocation.antigravityProgress,
-		liveLogPath: live,
-		loaderContext: formatReviewLoaderContext({ runId: payload.review_run_id, payload }),
-		timeoutMs: 60 * 60 * 1000,
-	});
-
-	const logBody = [result.stdout, result.stderr].filter(Boolean).join("\n--- stderr ---\n");
-	writeFileSync(logPath, logBody, "utf-8");
-
-	if (result.killed) throw new Error(`Review-fix cancelled (${taskId})`);
-	if (result.code !== 0) {
-		throw new Error(
-			result.stderr.trim() ||
-				`${agent.cli} review-fix failed (exit ${result.code}). See ${logPath}`,
-		);
-	}
-
-	const endedAt = new Date().toISOString();
-	const run: TaskRun = {
-		runId,
-		phase: "review_fix",
-		worker: agent.cli === "codex" || agent.cli === "claude" ? agent.cli : undefined,
-		startedAt,
-		endedAt,
-		exitCode: result.code,
-		paths: { output: logPath, live, prompt: promptPath },
-	};
-
-	patchTaskStatus(deps, taskId, "review_fail", { run });
-
-	const summary = [
-		`Review-fix ${taskId} finished (${agent.cli})`,
-		`Log: ${logPath}`,
-		`Live trace: ${live}`,
-		`Prompt: ${promptPath}`,
-	].join("\n");
-
-	return { summary, logPath };
 }

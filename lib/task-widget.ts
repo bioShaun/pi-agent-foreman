@@ -39,5 +39,5 @@ export function taskWidgetLines(cwd: string): string[] | undefined {
 }
 
 export function refreshTaskWidget(ctx: ExtensionCommandContext): void {
-	ctx.ui.setWidget("agent-foreman", taskWidgetLines(ctx.cwd));
+	ctx.ui.setWidget("agent-pipeline", taskWidgetLines(ctx.cwd));
 }

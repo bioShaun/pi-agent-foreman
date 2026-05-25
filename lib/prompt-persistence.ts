@@ -13,8 +13,6 @@ export interface PromptSnapshotMeta {
 	cli: string;
 	worker?: string;
 	reviewer?: string;
-	incorporated_review_run_id?: string;
-	finding_count?: number;
 }
 
 export function writePromptSnapshot(
@@ -33,10 +31,6 @@ export function writePromptSnapshot(
 		`cli: ${yamlQuote(meta.cli)}`,
 		meta.worker ? `worker: ${yamlQuote(meta.worker)}` : null,
 		meta.reviewer ? `reviewer: ${yamlQuote(meta.reviewer)}` : null,
-		meta.incorporated_review_run_id
-			? `incorporated_review_run_id: ${yamlQuote(meta.incorporated_review_run_id)}`
-			: null,
-		meta.finding_count !== undefined ? `finding_count: ${meta.finding_count}` : null,
 		"---",
 		"",
 	].filter(Boolean);

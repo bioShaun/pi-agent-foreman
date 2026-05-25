@@ -1,18 +1,29 @@
 {
-  "name": "pi-agent-foreman",
+  "name": "pi-agent-pipeline",
   "version": "0.1.0",
   "description": "Pi extension: Codex plans/reviews, Claude/Codex/Antigravity execute — unified /agent workflow in TUI",
-  "keywords": ["pi-package", "pi-extension", "agent", "codex", "claude"],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "agent",
+    "codex",
+    "claude"
+  ],
   "type": "module",
   "private": true,
   "pi": {
-    "extensions": ["./index.ts"],
-    "skills": ["./skills"]
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
   "scripts": {
     "check": "tsc --noEmit"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "typescript": "^6.0.3"
   }
 }

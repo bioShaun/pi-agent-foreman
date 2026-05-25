@@ -16,7 +16,7 @@ export interface ExecGateResult {
 }
 
 function gateDisabled(): boolean {
-	return process.env.FOREMAN_SKIP_EXEC_GATE === "1" || process.env.FOREMAN_SKIP_EXEC_GATE === "true";
+	return process.env.PIPELINE_SKIP_EXEC_GATE === "1" || process.env.PIPELINE_SKIP_EXEC_GATE === "true";
 }
 
 function isGatePythonPath(path: string): boolean {
@@ -77,7 +77,7 @@ function formatGateFailure(files: string[], output: string, fixPrefix: string): 
 		output.trim() || "(no ruff output)",
 		"",
 		`Fix: ${fixPrefix} check ${fileList} --fix`,
-		"Skip gate (not recommended): FOREMAN_SKIP_EXEC_GATE=1",
+		"Skip gate (not recommended): PIPELINE_SKIP_EXEC_GATE=1",
 	].join("\n");
 }
 
@@ -91,7 +91,7 @@ async function runRuffOnChangedPy(
 	opts?: { fix?: boolean; liveLogPath?: string },
 ): Promise<ExecGateResult> {
 	if (gateDisabled()) {
-		return { passed: true, skipped: true, files: [], skipReason: "FOREMAN_SKIP_EXEC_GATE" };
+		return { passed: true, skipped: true, files: [], skipReason: "PIPELINE_SKIP_EXEC_GATE" };
 	}
 
 	const files = await listExecGatePythonFiles(pi, cwd);

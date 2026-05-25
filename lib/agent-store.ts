@@ -62,7 +62,7 @@ export function requireTask(cwd: string, taskId: string): AgentTask {
 		[
 			`Task not found: ${taskId}`,
 			`Expected: ${path}`,
-			"Foreman task JSON may have been removed mid-run (common: worker ran `git stash -u` on untracked `.agent/`).",
+			"Pipeline task JSON may have been removed mid-run (common: worker ran `git stash -u` on untracked `.agent/`).",
 			"Recover: `git stash list` then `git checkout stash@{N} -- .agent/tasks/` (and `.agent/manifest.json` `.agent/plans/` if needed).",
 		].join("\n"),
 	);

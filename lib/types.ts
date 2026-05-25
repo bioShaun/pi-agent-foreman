@@ -16,6 +16,14 @@ export function isWorker(value: string): value is Worker {
 	return (WORKERS as readonly string[]).includes(value);
 }
 
+export const FIXERS = ["claude", "codex", "antigravity"] as const;
+
+export type Fixer = (typeof FIXERS)[number];
+
+export function isFixer(value: string): value is Fixer {
+	return (FIXERS as readonly string[]).includes(value);
+}
+
 export type ReviewVerdictKind = "approve" | "revise" | "reject";
 
 export type ReviewFindingSeverity = "critical" | "major" | "minor" | "nit";
@@ -35,7 +43,7 @@ export interface ReviewVerdictPayload {
 	findings: ReviewFinding[];
 }
 
-export type RunPhase = "exec" | "review" | "review_fix" | "plan";
+export type RunPhase = "exec" | "review" | "fix" | "plan";
 
 export interface TaskRun {
 	runId: string;
@@ -96,6 +104,8 @@ export interface AgentTask {
 		reviewVerdict?: string;
 		execPrompt?: string;
 		reviewPrompt?: string;
+		fixLog?: string;
+		fixPrompt?: string;
 		branch?: string;
 		liveTrace?: string;
 	};

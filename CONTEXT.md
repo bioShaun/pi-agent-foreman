@@ -1,6 +1,8 @@
-# Agent Foreman
+# Agent Pipeline
 
-Pi TUI extension that orchestrates a multi-CLI pipeline: Codex plans; Claude or Codex review; Claude/Codex/Antigravity execute tasks. All state lives under `.agent/` in the git repo.
+Pi TUI extension that orchestrates a multi-CLI pipeline: Codex plans; Claude/Codex/Antigravity execute tasks; Claude or Codex review; a fixer (Claude by default) cleans up all review failures in a single aggregated pass. All state lives under `.agent/` in the git repo.
+
+Workflow: `plan → exec → review →` (if any `review_fail`) `fix → review_pass`. There is no per-task auto-retry; failed reviews are deferred to one fixer invocation that sees every failure at once.
 
 ## Language
 
@@ -17,7 +19,7 @@ One invocation of a worker or reviewer CLI. Identified by `{UTC-ts}-{provider}`;
 _Avoid_: Attempt, execution, session
 
 **Run phase**:
-Which kind of run this is: `exec` (worker executes task), `review` (Claude or Codex reviews uncommitted changes), or `plan` (Codex generates a plan).
+Which kind of run this is: `exec` (worker executes task), `review` (Claude or Codex reviews uncommitted changes), `fix` (fixer applies a single aggregated pass over all `review_fail` tasks), or `plan` (Codex generates a plan).
 _Avoid_: Stage, step, action
 
 **Task run**:
@@ -44,8 +46,12 @@ _Avoid_: State machine, status helper
 The CLI that executes a task: `claude`, `codex`, or `antigravity`. The Antigravity worker resolves to the `agy` binary on PATH (alias `antigravity` also accepted).
 _Avoid_: Agent, executor, model
 
+**Fixer**:
+The CLI that cleans up review failures: `claude` (default), `codex`, or `antigravity`. Receives one aggregated prompt covering **every** `review_fail` task in the active plan (task description + review report + structured findings per task) and runs once. On success every included task is marked `review_pass` directly — there is no re-review.
+_Avoid_: Patcher, doctor, retry agent
+
 **Role agent**:
-A markdown-defined persona (`agents/*.md`) with a role (`planner`, `worker`, `reviewer`), CLI hint, and system prompt. Project overrides via `.pi/agents/`. The `cli` field drives both availability checks and invocation args.
+A markdown-defined persona (`agents/*.md`) with a role (`planner`, `worker`, `reviewer`, `fixer`), CLI hint, and system prompt. Project overrides via `.pi/agents/`. The `cli` field drives both availability checks and invocation args.
 _Avoid_: Persona, bot, profile
 
 **Role invocation**:
@@ -58,5 +64,5 @@ _Avoid_: Checkpoint, state file
 
 ## Example dialogue
 
-> **Dev:** I want to re-run T003 after review failed.
-> **Expert:** That's an exec-phase task run. The task is `review_fail`, so the run module injects the latest review artifact as feedback, runs the worker, writes a new exec log, and sets status to `done`. Review is a separate run phase afterward.
+> **Dev:** Reviews failed on T002 and T005. How do I fix them?
+> **Expert:** Run `/agent fix`. The fix-phase task run gathers every `review_fail` task in the active plan (T002 and T005), builds a single aggregated prompt that includes each task's description, review report, and structured findings, and invokes one fixer CLI call (Claude by default; override with `--fixer codex|antigravity`). On exit 0 every included task is marked `review_pass` directly and the per-plan log lands at `.agent/artifacts/fix/PLAN-00N/{runId}.log`. There is no re-review step.

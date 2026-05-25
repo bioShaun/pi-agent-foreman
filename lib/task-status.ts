@@ -1,14 +1,17 @@
-import type { AgentTask, TaskStatus, Worker } from "./types.ts";
+import type { AgentTask, TaskStatus } from "./types.ts";
 
 export function isExecRunnable(status: TaskStatus): boolean {
-	// `running` treated as stale — e.g. invoke threw before status was reverted
-	return status === "pending" || status === "review_fail" || status === "running";
+	// `running` treated as stale — e.g. invoke threw before status was reverted.
+	// `review_fail` is fixed by `/agent fix`, not re-exec.
+	return status === "pending" || status === "running";
 }
 
-export function isReviewRunnable(status: TaskStatus, opts?: { fix?: boolean }): boolean {
-	if (status === "done") return true;
-	if (opts?.fix && status === "review_fail") return true;
-	return false;
+export function isReviewRunnable(status: TaskStatus): boolean {
+	return status === "done";
+}
+
+export function isFixRunnable(status: TaskStatus): boolean {
+	return status === "review_fail";
 }
 
 const MARK_PASS_ELIGIBLE: ReadonlySet<TaskStatus> = new Set(["done", "review_fail", "running"]);
@@ -33,14 +36,10 @@ export function isRunStillFailing(status: TaskStatus): boolean {
 	return status === "review_fail";
 }
 
-/** Status to restore when exec is cancelled or fails — keep review_fail for review retries. */
-export function execRevertStatus(priorStatus: TaskStatus, incorporatingReview: boolean): TaskStatus {
-	if (priorStatus === "review_fail" || incorporatingReview) return "review_fail";
+/** Status to restore when exec is cancelled or fails. */
+export function execRevertStatus(priorStatus: TaskStatus): TaskStatus {
+	if (priorStatus === "review_fail") return "review_fail";
 	return "pending";
-}
-
-export function execHintAfterReviewFail(taskId: string, worker?: Worker): string {
-	return `\nNext: /agent exec ${taskId} --worker ${worker ?? "claude"}  (structured findings in exec prompt; verify .agent/prompts/exec/${taskId}/)`;
 }
 
 export function statusIcon(status: TaskStatus): string {

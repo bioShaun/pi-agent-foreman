@@ -5,13 +5,13 @@
 
 ## Context
 
-Foreman today runs exec batches strictly sequentially (`for await` in `runExecAll`). Plan task order is conventional only — there is no `depends_on`, and `tasksForExecBatch` does not gate on upstream completion. Review batches remain sequential and inspect a shared working tree (`git diff`), so parallel review would race on the same uncommitted changes.
+Pipeline today runs exec batches strictly sequentially (`for await` in `runExecAll`). Plan task order is conventional only — there is no `depends_on`, and `tasksForExecBatch` does not gate on upstream completion. Review batches remain sequential and inspect a shared working tree (`git diff`), so parallel review would race on the same uncommitted changes.
 
 We studied [oh-my-claudecode](https://github.com/bioShaun/oh-my-claudecode) (OMC) ultrawork and team task readiness as reference, not as a port target.
 
-## OMC → Foreman adaptation checklist
+## OMC → Pipeline adaptation checklist
 
-| OMC concept | Location | Foreman adaptation | Phase |
+| OMC concept | Location | Pipeline adaptation | Phase |
 |-------------|----------|-------------------|-------|
 | Parallel waves for independent work | `skills/ultrawork/SKILL.md` | `/agent exec --all --parallel N` runs up to N ready tasks per wave | **2** |
 | Dependency matrix in plan | ultrawork step 5 | Planner JSON `depends_on: ["T001"]` on each task | **2** |
@@ -23,9 +23,9 @@ We studied [oh-my-claudecode](https://github.com/bioShaun/oh-my-claudecode) (OMC
 | Git worktree per worker | `src/team/git-worktree.ts` | Defer — parallel exec on one tree risks file conflicts | 3 |
 | Merge orchestrator | `src/team/merge-orchestrator.ts` | Defer — manual merge / re-review until worktrees | 4 |
 | tmux / team runtime v2 | `src/team/runtime-v2.ts` | **Skip** — Pi extension spawns CLIs; no tmux panes | — |
-| Native `TeamCreate` API | Claude Code teams | **Skip** — not available to Pi foreman | — |
-| Review / verify loop | team staged pipeline | Keep foreman exec → review; review batch **serial only** | **2** |
-| Boulder resume pointer | OMC + foreman `boulder.json` | Extend later with `parallel` in batch metadata | 3 |
+| Native `TeamCreate` API | Claude Code teams | **Skip** — not available to Pi pipeline | — |
+| Review / verify loop | team staged pipeline | Keep pipeline exec → review; review batch **serial only** | **2** |
+| Boulder resume pointer | OMC + pipeline `boulder.json` | Extend later with `parallel` in batch metadata | 3 |
 
 ## Decisions
 
@@ -86,4 +86,4 @@ We studied [oh-my-claudecode](https://github.com/bioShaun/oh-my-claudecode) (OMC
 
 - OMC ultrawork: `/Users/guilixuan/script/oh-my-claudecode/skills/ultrawork/SKILL.md`
 - OMC readiness: `/Users/guilixuan/script/oh-my-claudecode/src/team/state/tasks.ts`
-- Foreman CONTEXT: `CONTEXT.md`
+- Pipeline CONTEXT: `CONTEXT.md`

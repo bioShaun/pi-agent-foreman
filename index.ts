@@ -1,7 +1,7 @@
 /**
- * Agent Foreman — Pi extension for multi-CLI orchestration.
+ * Agent Pipeline — Pi extension for multi-CLI orchestration.
  *
- * TUI: /agent plan | exec | run | review [--fix] | mark_pass | clear | resume | list | logs
+ * TUI: /agent plan | exec | run | review | fix | mark_pass | clear | resume | list | logs
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -14,6 +14,7 @@ const SUBCOMMANDS = [
 	"run",
 	"exec",
 	"review",
+	"fix",
 	"mark_pass",
 	"clear",
 	"resume",
@@ -35,13 +36,13 @@ function agentNotifySummary(summary: string): string {
 	return line?.trim() ?? "Done";
 }
 
-export default function agentForemanExtension(pi: ExtensionAPI): void {
+export default function agentPipelineExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		refreshTaskWidget(ctx);
 	});
 
 	pi.registerCommand("agent", {
-		description: "Agent foreman: plan (Codex), exec (worker), review (Codex)",
+		description: "Agent pipeline: plan (Codex), exec (worker), review (Codex)",
 		getArgumentCompletions: (prefix) => {
 			const parts = prefix.split(/\s+/);
 			if (parts.length <= 1 && !prefix.includes(" ")) {
@@ -70,7 +71,7 @@ export default function agentForemanExtension(pi: ExtensionAPI): void {
 
 				pi.sendMessage(
 					{
-						customType: "agent-foreman-result",
+						customType: "agent-pipeline-result",
 						content: summary,
 						display: true,
 					},
@@ -83,7 +84,7 @@ export default function agentForemanExtension(pi: ExtensionAPI): void {
 				const message = err instanceof Error ? err.message : String(err);
 				pi.sendMessage(
 					{
-						customType: "agent-foreman-result",
+						customType: "agent-pipeline-result",
 						content: message,
 						display: true,
 					},
@@ -95,7 +96,7 @@ export default function agentForemanExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.registerMessageRenderer("agent-foreman-result", (message, _opts, theme) => {
+	pi.registerMessageRenderer("agent-pipeline-result", (message, _opts, theme) => {
 		const text = typeof message.content === "string" ? message.content : String(message.content);
 		const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
 		box.addChild(new Text(theme.fg("accent", "agent ") + text, 0, 0));

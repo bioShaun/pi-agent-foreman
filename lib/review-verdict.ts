@@ -10,11 +10,11 @@ export function renderReviewVerdictContract(taskId: string): string {
 	return [
 		"",
 		"---",
-		"## REQUIRED: Structured verdict (foreman-verdict)",
+		"## REQUIRED: Structured verdict (pipeline-verdict)",
 		"",
-		"After your narrative review, end the response with a fenced JSON block tagged `foreman-verdict`:",
+		"After your narrative review, end the response with a fenced JSON block tagged `pipeline-verdict`:",
 		"",
-		"```json foreman-verdict",
+		"```json pipeline-verdict",
 		"{",
 		`  "task_id": "${taskId}",`,
 		'  "verdict": "approve" | "revise" | "reject",',
@@ -91,9 +91,9 @@ export function parseReviewVerdictPayload(raw: unknown, taskId: string, reviewRu
 	};
 }
 
-function extractForemanVerdictBlocks(body: string): string[] {
+function extractPipelineVerdictBlocks(body: string): string[] {
 	const blocks: string[] = [];
-	const re = /```json\s+foreman-verdict\s*\n([\s\S]*?)```/gi;
+	const re = /```json\s+pipeline-verdict\s*\n([\s\S]*?)```/gi;
 	for (const match of body.matchAll(re)) {
 		if (match[1]?.trim()) blocks.push(match[1].trim());
 	}
@@ -127,7 +127,7 @@ export function extractReviewVerdictFromBody(
 	taskId: string,
 	reviewRunId: string,
 ): ReviewVerdictPayload | undefined {
-	for (const block of extractForemanVerdictBlocks(body)) {
+	for (const block of extractPipelineVerdictBlocks(body)) {
 		const payload = tryParseVerdictBlock(block, taskId, reviewRunId);
 		if (payload) return payload;
 	}
@@ -201,19 +201,6 @@ export interface ReviewContext {
 	rawReview?: string;
 }
 
-/** Whether exec should inject the latest failed review (not only when status is review_fail). */
-export function shouldIncorporateReviewOnExec(task: AgentTask): boolean {
-	if (task.status === "review_fail") return true;
-	if (task.status === "review_pass") return false;
-	if (!task.artifacts.review) return false;
-
-	const payload = loadReviewVerdictJson(task.artifacts.reviewVerdict);
-	if (payload) return !verdictPassed(payload);
-
-	// Review artifact exists but no JSON — e.g. legacy review or cancelled retry left status pending
-	return task.status === "pending" || task.status === "done" || task.status === "running";
-}
-
 export function loadReviewContext(
 	reviewMdPath: string | undefined,
 	reviewVerdictPath: string | undefined,
@@ -257,13 +244,6 @@ export function formatFindingsSummary(payload: ReviewVerdictPayload): string {
 	return `Findings: ${payload.findings.length} [${bySeverity}] — ${payload.summary}`;
 }
 
-const SEVERITY_RANK: Record<ReviewFinding["severity"], number> = {
-	critical: 0,
-	major: 1,
-	minor: 2,
-	nit: 3,
-};
-
 /** Pinned loader lines for the review phase (scope + prior artifacts). */
 export function formatReviewPhaseLoaderContext(task: AgentTask, cwd: string): string[] {
 	const lines: string[] = ["↳ reviewing uncommitted git changes"];
@@ -287,27 +267,22 @@ export function formatReviewPhaseLoaderContext(task: AgentTask, cwd: string): st
 	return lines;
 }
 
-/** Pinned loader lines shown while re-exec incorporates a failed review. */
-export function formatReviewLoaderContext(ctx: ReviewContext, maxFindings = 3): string[] {
-	const lines: string[] = [];
-
-	if (ctx.payload) {
-		const { findings, summary, review_run_id: runId } = ctx.payload;
-		lines.push(`↳ loaded review ${runId} · ${findings.length} finding${findings.length === 1 ? "" : "s"}`);
-		if (summary.trim()) {
-			lines.push(`  ${truncate(summary, 76)}`);
-		}
-		const sorted = [...findings].sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
-		for (const f of sorted.slice(0, maxFindings)) {
-			const loc = f.file ? ` · ${f.file}${f.line !== undefined ? `:${f.line}` : ""}` : "";
-			lines.push(`  [${f.severity}] ${truncate(f.message, 56)}${loc}`);
-		}
-		if (findings.length > maxFindings) {
-			lines.push(`  … +${findings.length - maxFindings} more finding(s)`);
-		}
-		return lines;
+/** Pinned loader lines shown while fixer runs over multiple failed tasks. */
+export function formatFixerLoaderContext(
+	blocks: Array<{ taskId: string; payload?: ReviewVerdictPayload }>,
+	maxBlocks = 4,
+): string[] {
+	const lines: string[] = [
+		`↳ fixing ${blocks.length} review_fail task${blocks.length === 1 ? "" : "s"}`,
+	];
+	for (const b of blocks.slice(0, maxBlocks)) {
+		const findings = b.payload?.findings.length ?? 0;
+		const summary = b.payload?.summary?.trim() ?? "";
+		const tail = summary ? ` · ${truncate(summary, 56)}` : "";
+		lines.push(`  ${b.taskId}: ${findings} finding${findings === 1 ? "" : "s"}${tail}`);
 	}
-
-	lines.push(`↳ loaded review ${ctx.runId} · report (no structured findings)`);
+	if (blocks.length > maxBlocks) {
+		lines.push(`  … +${blocks.length - maxBlocks} more task(s)`);
+	}
 	return lines;
 }

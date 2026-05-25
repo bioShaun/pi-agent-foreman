@@ -1,8 +1,16 @@
-# pi-agent-foreman
+# pi-agent-pipeline
 
 [English](README.md) · [中文](README.zh-CN.md)
 
-Pi TUI extension: **Codex** plans; **Claude** or **Codex** review; **Claude**, **Codex**, or **Antigravity (`agy`)** execute tasks — one `/agent` workflow.
+Pi TUI extension: **Codex** plans; **Claude** or **Codex** review; **Claude**, **Codex**, or **Antigravity (`agy`)** execute tasks; a dedicated **fixer** (default Claude) cleans up all review failures in one pass — one `/agent` workflow.
+
+## Workflow
+
+```
+plan ─► exec T001 ─► review T001 ─┐
+       │                          ├─► fix ─► review_pass
+       └► exec T002 ─► review T002┘   (single fixer pass over all review_fail tasks)
+```
 
 ## Prerequisites
 
@@ -12,6 +20,7 @@ Pi TUI extension: **Codex** plans; **Claude** or **Codex** review; **Claude**, *
   - **Plan:** `codex`
   - **Review:** `codex` (default), `claude` (`--reviewer claude`)
   - **Exec:** `claude`, and/or `codex`, and/or `agy` (Antigravity CLI)
+  - **Fix:** `claude` (default), `codex`, or `agy` (`--fixer …`)
 
 Install Antigravity CLI:
 
@@ -23,15 +32,15 @@ command -v agy
 ## Install
 
 ```bash
-git clone git@github.com:bioShaun/pi-agent-foreman.git
-cd pi-agent-foreman
+git clone git@github.com:bioShaun/pi-agent-pipeline.git
+cd pi-agent-pipeline
 pi install -l .
 ```
 
 Or one-off without installing the package:
 
 ```bash
-pi -e /path/to/pi-agent-foreman/index.ts
+pi -e /path/to/pi-agent-pipeline/index.ts
 ```
 
 ## Commands
@@ -40,29 +49,31 @@ pi -e /path/to/pi-agent-foreman/index.ts
 |---------|-------------|
 | `/agent plan <goal>` | Codex generates a plan → tasks under `.agent/` |
 | `/agent list` | List tasks (widget also shows active plan in TUI) |
-| `/agent run T001 [--worker claude] [--reviewer claude\|codex]` | Exec → review → **one auto-retry** if review fails |
+| `/agent run T001 [--worker claude] [--reviewer claude\|codex]` | Exec → review (single pass, no auto-retry) |
 | `/agent exec T001 [--worker claude]` | Execute a single task |
-| `/agent exec --all [--worker claude]` | Exec all `pending` / `review_fail` tasks in active plan |
-| | Options: `--from T003`, `--continue-on-error` |
+| `/agent exec --all [--worker claude]` | Exec all `pending` tasks in active plan |
+| | Options: `--parallel N`, `--from T003`, `--continue-on-error` |
 | `/agent resume` | Resume last stopped batch from `boulder.json` |
 | `/agent resume --continue-on-error` | Resume and keep going after task failures |
 | `/agent resume status` | Show resume info without running |
-| `/agent review T001 [--reviewer claude\|codex] [--fix]` | Review uncommitted changes (default: Codex) |
-| `/agent review --all [--reviewer claude\|codex] [--fix]` | Review all `done` tasks (`--fix` also includes `review_fail`) |
-| | Options: `--from T003`, `--continue-on-error`, `--fix` (bounded review-fix loop) |
+| `/agent review T001 [--reviewer claude\|codex]` | Review uncommitted changes (default: Codex) |
+| `/agent review --all [--reviewer claude\|codex]` | Review all `done` tasks |
+| | Options: `--from T003`, `--continue-on-error` |
+| `/agent fix [--fixer claude\|codex\|antigravity] [--from T003]` | **Single fixer pass** over all `review_fail` tasks → `review_pass` |
 | `/agent mark_pass T001` | After **manual** fix/review — set task to `review_pass` |
 | `/agent mark_pass --all [--from T003]` | Mark all `done` / `review_fail` / stale `running` in plan |
 | `/agent logs T001` | Run history and artifact paths |
 | `/agent help` | Command reference |
 
 **Workers:** `--worker claude` (default) · `codex` · `antigravity`  
-**Reviewers:** `--reviewer codex` (default) · `claude`
+**Reviewers:** `--reviewer codex` (default) · `claude`  
+**Fixers:** `--fixer claude` (default) · `codex` · `antigravity`
 
 ```
 /agent plan Improve test coverage
 /agent exec --all --worker claude
 /agent review --all --reviewer claude
-/agent resume
+/agent fix                         # one fixer pass cleans up all review_fail
 ```
 
 ## Agent roles (`agents/*.md`)
@@ -75,8 +86,11 @@ Role agents are markdown files with YAML frontmatter. **Project overrides packag
 | `worker-claude.md` | Exec | `claude -p` (stream-json) |
 | `worker-codex.md` | Exec | `codex exec -` |
 | `worker-antigravity.md` | Exec | `agy -p` (Antigravity CLI) |
-| `reviewer.md` | Review | `codex exec -` (stream-json + foreman-verdict) |
-| `reviewer-claude.md` | Review | `claude -p` (git diff + foreman-verdict) |
+| `reviewer.md` | Review | `codex exec -` (stream-json + pipeline-verdict) |
+| `reviewer-claude.md` | Review | `claude -p` (git diff + pipeline-verdict) |
+| `fixer-claude.md` | Fix | `claude -p` (aggregated multi-task prompt) |
+| `fixer-codex.md` | Fix | `codex exec -` (aggregated multi-task prompt) |
+| `fixer-antigravity.md` | Fix | `agy -p` (aggregated multi-task prompt) |
 
 Optional frontmatter:
 
@@ -84,36 +98,36 @@ Optional frontmatter:
 - `bin` — executable on `PATH` (e.g. `bin: agy` for Antigravity)
 - `worker` — worker id for exec (`claude`, `codex`, `antigravity`)
 - `reviewer` — reviewer id (`claude`, `codex`)
+- `fixer` — fixer id (`claude`, `codex`, `antigravity`)
 
-After `review_fail`, re-running `/agent exec T001` injects structured findings from `.agent/artifacts/review/T001/{runId}.json` (or falls back to the review report). Verify via `.agent/prompts/exec/T001/{runId}.md` (`incorporated_review_run_id` in frontmatter).
+### How `fix` works
 
-### Review-fix (`--fix`)
+`/agent fix` collects **every** `review_fail` task in the active plan, builds a single aggregated prompt (task description + review report + structured findings per task), and invokes one fixer CLI call. On success every included task is marked `review_pass` directly — there is no re-review.
 
-`/agent review T001 --fix` runs a **bounded** loop (see [ADR 0002](docs/adr/0002-review-fix-loop.md)):
+Artifacts (plan-scoped, single run covers many tasks):
 
-1. Review → if pass, stop.
-2. **Major/critical** findings → `review_fail` (use `/agent exec`).
-3. **Lint-only** → `ruff check --fix` + pre-review gate → `review_pass` if gate OK (no re-review).
-4. **Minor** (or lint+minor after step 3) → reviewer fix (prompt mode) → **one** re-review → pass or fail.
-5. Stops if working tree unchanged or findings unchanged after fix (no infinite loop).
+- Log: `.agent/artifacts/fix/PLAN-001/{runId}.log`
+- Prompt: `.agent/prompts/fix/PLAN-001/{runId}.md`
+- Live trace: `.agent/traces/PLAN-001/{runId}.live.log`
+- Each task gets a `runs[]` entry with `phase: "fix"` plus `artifacts.fixLog` / `artifacts.fixPrompt`.
 
 ## Task lifecycle
 
 | Status | Meaning |
 |--------|---------|
-| `pending` | Not executed yet (or exec failed / cancelled → back to pending) |
+| `pending` | Not executed yet (exec failure / cancel returns to `pending`) |
 | `running` | Exec in progress |
 | `done` | Exec finished, awaiting review |
-| `review_pass` | Review passed |
-| `review_fail` | Review failed — re-exec picks up review feedback |
+| `review_pass` | Review passed (or fixer pass succeeded) |
+| `review_fail` | Review failed — run `/agent fix` to apply a single aggregated fixer pass |
 
 ## Pre-review gate (after exec, before review)
 
-After the worker exits 0, foreman runs `ruff check` on **changed Python files** in the same scope the reviewer uses (staged + unstaged + untracked, excluding `.agent/`):
+After the worker exits 0, pipeline runs `ruff check` on **changed Python files** in the same scope the reviewer uses (staged + unstaged + untracked, excluding `.agent/`):
 
 - **Pass** → task becomes `done`, review may proceed
 - **Fail** → exec is **not** complete; status reverts; error includes a `ruff check … --fix` hint
-- **Skipped** when there are no changed `.py` files, ruff is unavailable, or `FOREMAN_SKIP_EXEC_GATE=1`
+- **Skipped** when there are no changed `.py` files, ruff is unavailable, or `PIPELINE_SKIP_EXEC_GATE=1`
 
 Ruff resolution: `.venv/bin/ruff` → `uv run ruff` → `ruff` on PATH.
 
@@ -132,8 +146,10 @@ Layout inspired by [oh-my-claudecode REFERENCE](https://github.com/Yeachan-Heo/o
 | Review | `artifacts/review/T001/{runId}.md` | Narrative review report |
 | Review verdict | `artifacts/review/T001/{runId}.json` | Structured findings (`approve/revise/reject`) |
 | Review prompt | `prompts/review/T001/{runId}.md` | Full reviewer prompt (audit) |
+| Fix log | `artifacts/fix/PLAN-001/{runId}.log` | One log per fix invocation (covers all included tasks) |
+| Fix prompt | `prompts/fix/PLAN-001/{runId}.md` | Aggregated fixer prompt |
 | Plan artifact | `artifacts/plan/PLAN-001/{runId}.md` | Codex plan output |
-| Live trace | `traces/T001/{runId}.live.log` | Stream tail while exec runs |
+| Live trace | `traces/T001/{runId}.live.log` · `traces/PLAN-001/{runId}.live.log` | Stream tail while exec/review/fix runs |
 
 Run ID format: `{UTC-ts}-{provider}` (e.g. `20250525T120058Z-claude`).
 
@@ -144,6 +160,7 @@ Each re-run creates a **new** artifact file; `tasks/T001.json` always points at 
 ```
 /agent  →  index.ts  →  lib/commands.ts
               │              ├── task-run.ts      (exec / review lifecycle)
+              │              ├── fix-run.ts       (aggregated fixer pass)
               │              ├── agents.ts        (role agent discovery)
               │              ├── role-invoke.ts   (cli → spawn args)
               │              ├── agent-store.ts   (persistence)

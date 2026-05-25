@@ -13,4 +13,4 @@ Check:
 - Edge cases and regressions
 - Tests updated if needed
 
-Follow the structured **foreman-verdict** JSON contract appended to your prompt.
+Follow the structured **pipeline-verdict** JSON contract appended to your prompt.

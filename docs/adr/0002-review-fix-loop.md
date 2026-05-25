@@ -2,45 +2,32 @@
 
 ## Status
 
-Accepted
+**Superseded** by the dedicated `fixer` role and `/agent fix` command (see [README.md](../../README.md#how-fix-works)).
 
-## Context
+## What replaced it
 
-Review batches often fail on mechanical lint (Ruff) or minor issues. Re-running full worker exec is slow. We want a bounded loop: review → fix → verify → `review_pass`, without infinite cycles.
+The bounded per-task `--fix` loop (lint → ruff+gate → reviewer-fix → 1 re-review) was removed in favor of a single, **plan-scoped** fixer pass:
 
-## Decision
+- New role: `fixer` (`agents/fixer-{claude,codex,antigravity}.md`), default Claude.
+- New command: `/agent fix [--fixer claude|codex|antigravity] [--from T003]`.
+- Behavior: collect **every** `review_fail` task in the active plan → build one aggregated prompt (task + review report + structured findings per task) → **single** CLI invocation → on success mark each included task `review_pass` directly (no re-review).
+- Artifacts are plan-scoped: `.agent/artifacts/fix/PLAN-00N/{runId}.log`, `.agent/prompts/fix/PLAN-00N/{runId}.md`, `.agent/traces/PLAN-00N/{runId}.live.log`.
 
-Add `/agent review T00N --fix` and `/agent review --all --fix`.
+Also removed alongside the loop:
 
-Review batch with `--fix` includes tasks in `done` **or** `review_fail` (default batch remains `done` only).
+- `/agent review --fix` flag and the per-task `runReviewWithFixLoop` / `runReviewFixPhase` orchestration.
+- `/agent run` auto-retry-on-review-fail behavior (run is now exec → review, single pass).
+- Re-exec injection of structured review findings into the worker prompt (re-exec on a `review_fail` task is no longer the path; use `/agent fix` instead).
+- `review_fix` run phase, `lib/review-fix-loop.ts`, `lib/review-fix.ts`.
 
-### Flow
+## Why
 
-1. **Review** (attempt 1) — unchanged `runReviewPhase`.
-2. If **PASS** → `review_pass`, stop.
-3. If **FAIL** without structured `foreman-verdict` findings → `review_fail`, stop (no loop).
-4. If findings include **major/critical** → `review_fail`, stop (escalate to `/agent exec`).
-5. **Lint-only** findings → `ruff check --fix` on changed `.py` → **exec gate** → if gate OK → `review_pass` (**no re-review**).
-6. **Lint + minor** → lint path first; if gate OK → **review-fix** (reviewer in prompt mode) → **one re-review** → pass or fail.
-7. **Minor-only** → review-fix → one re-review → pass or fail.
+- One simple workflow (`exec → review → fix`) is easier to reason about than per-task lint/minor/major routing.
+- A single aggregated fixer pass gives the model global context across failures and is cheaper than N re-reviews.
+- Decision 3(b): trust the fixer; skip re-review (use `/agent review T00N` manually if you need a second opinion).
 
-### Anti-loop guards
+## Migration notes
 
-| Guard | Rule |
-|-------|------|
-| Hard cap | At most **1** review-fix + re-review cycle per invocation (`MAX_REVIEW_FIX_CYCLES`) |
-| Lint path | No LLM re-review; gate is the verifier |
-| No progress | Same finding fingerprint after fix, or unchanged `git diff` tree hash → stop `review_fail` |
-| Blocking | Major/critical never enter fix loop |
-
-### Artifacts
-
-- Review-fix runs: `.agent/artifacts/review_fix/T00N/{runId}.log`
-- Prompts: `.agent/prompts/review_fix/T00N/{runId}.md`
-- Run phase: `review_fix` on `TaskRun`
-
-## Consequences
-
-- Default `/agent review` behavior unchanged (no `--fix`).
-- Lint-only passes may mark `review_pass` after auto-fix even when initial review said FAIL.
-- Major issues still require worker exec.
+- Old `.agent/artifacts/review_fix/...` artifacts on disk are inert; the new pipeline neither reads nor writes that path.
+- `tasks/T00N.json` entries with `runs[].phase: "review_fix"` are tolerated at runtime (display only).
+- `FOREMAN_SKIP_EXEC_GATE` was renamed to `PIPELINE_SKIP_EXEC_GATE` during the broader rename.
