@@ -1,4 +1,5 @@
 import { loadManifest, loadPlan, loadTask } from "./agent-store.ts";
+import { areExecDepsMet } from "./task-deps.ts";
 import { isExecRunnable, isReviewRunnable } from "./task-status.ts";
 import type { AgentPlan, AgentTask } from "./types.ts";
 
@@ -17,13 +18,15 @@ export function loadActivePlan(cwd: string): AgentPlan {
 export interface BatchSelection {
 	plan: AgentPlan;
 	runnable: AgentTask[];
+	/** Exec-runnable but waiting on depends_on. */
+	blocked: AgentTask[];
 	skipped: AgentTask[];
 }
 
 function tasksForBatch(
 	cwd: string,
 	isRunnable: (status: AgentTask["status"]) => boolean,
-	opts?: { fromTaskId?: string },
+	opts?: { fromTaskId?: string; checkDeps?: boolean },
 ): BatchSelection {
 	const plan = loadActivePlan(cwd);
 	let ids = [...plan.taskIds];
@@ -36,20 +39,28 @@ function tasksForBatch(
 	}
 
 	const runnable: AgentTask[] = [];
+	const blocked: AgentTask[] = [];
 	const skipped: AgentTask[] = [];
 	for (const id of ids) {
 		const task = loadTask(cwd, id);
 		if (!task) continue;
-		if (isRunnable(task.status)) runnable.push(task);
-		else skipped.push(task);
+		if (!isRunnable(task.status)) {
+			skipped.push(task);
+			continue;
+		}
+		if (opts?.checkDeps && !areExecDepsMet(task, cwd)) {
+			blocked.push(task);
+			continue;
+		}
+		runnable.push(task);
 	}
-	return { plan, runnable, skipped };
+	return { plan, runnable, blocked, skipped };
 }
 
 export type ExecBatchSelection = BatchSelection;
 
 export function tasksForExecBatch(cwd: string, opts?: { fromTaskId?: string }): BatchSelection {
-	return tasksForBatch(cwd, isExecRunnable, opts);
+	return tasksForBatch(cwd, isExecRunnable, { ...opts, checkDeps: true });
 }
 
 export type ReviewBatchSelection = BatchSelection;

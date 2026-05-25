@@ -20,13 +20,14 @@ import {
 import { formatBoulderStatus, parseResumeArgs, resolveBoulderResume } from "./boulder-resume.ts";
 import { formatTaskList, formatTaskLogs } from "./format-tasks.ts";
 import { tasksForExecBatch, tasksForReviewBatch } from "./task-queries.ts";
+import { areExecDepsMet } from "./task-deps.ts";
 import { makeTaskRunDeps, runExecPhase, runReviewPhase } from "./task-run.ts";
 import { refreshTaskWidget } from "./task-widget.ts";
-import { isRunComplete, isRunStillFailing } from "./task-status.ts";
+import { isExecRunnable, isRunComplete, isRunStillFailing } from "./task-status.ts";
 import type { Reviewer, Worker } from "./types.ts";
 
-function foremanTaskDeps(pi: ExtensionAPI, ctx: ExtensionCommandContext) {
-	return makeTaskRunDeps(pi, ctx, () => refreshTaskWidget(ctx));
+function foremanTaskDeps(pi: ExtensionAPI, ctx: ExtensionCommandContext, opts?: { silent?: boolean }) {
+	return makeTaskRunDeps(pi, ctx, () => refreshTaskWidget(ctx), opts);
 }
 
 export async function runPlan(pi: ExtensionAPI, ctx: ExtensionCommandContext, goal: string): Promise<string> {
@@ -104,26 +105,28 @@ export async function runExec(
 async function runExecAll(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
-	opts: { worker: Worker; fromTaskId?: string; continueOnError: boolean },
+	opts: { worker: Worker; fromTaskId?: string; continueOnError: boolean; parallel: number },
 ): Promise<string> {
-	const { plan, runnable, skipped } = tasksForExecBatch(ctx.cwd, { fromTaskId: opts.fromTaskId });
+	const selection = tasksForExecBatch(ctx.cwd, { fromTaskId: opts.fromTaskId });
+	const pending = new Set([...selection.runnable, ...selection.blocked].map((t) => t.id));
 
-	if (runnable.length === 0) {
+	if (pending.size === 0) {
 		const skippedSummary =
-			skipped.length > 0
-				? `\nSkipped (${skipped.length}): ${skipped.map((t) => `${t.id}[${t.status}]`).join(", ")}`
+			selection.skipped.length > 0
+				? `\nSkipped (${selection.skipped.length}): ${selection.skipped.map((t) => `${t.id}[${t.status}]`).join(", ")}`
 				: "";
-		return `No runnable tasks in ${plan.id} (pending or review_fail only).${skippedSummary}\n\nNext: /agent list`;
+		return `No runnable tasks in ${selection.plan.id} (pending or review_fail with deps met).${skippedSummary}\n\nNext: /agent list`;
 	}
 
 	await assertRoleAgentAvailable(pi, ctx.cwd, "worker", opts.worker);
 
 	const batchStartedAt = new Date().toISOString();
 	const boulder = loadBoulder(ctx.cwd);
+	const firstTaskId = (selection.runnable[0] ?? selection.blocked[0])!.id;
 	if (boulder) {
 		saveBoulder(ctx.cwd, {
 			...boulder,
-			current_task_id: runnable[0]!.id,
+			current_task_id: firstTaskId,
 			batch: {
 				mode: "exec",
 				worker: opts.worker,
@@ -133,60 +136,102 @@ async function runExecAll(
 	}
 
 	const sections: string[] = [
-		`## Exec batch — ${plan.id}`,
-		`Worker: ${opts.worker} · Runnable: ${runnable.map((t) => t.id).join(", ")}`,
+		`## Exec batch — ${selection.plan.id}`,
+		`Worker: ${opts.worker} · Parallel: ${opts.parallel} · Pool: ${[...pending].join(", ")}`,
 	];
 	if (opts.fromTaskId) sections.push(`From: ${opts.fromTaskId}`);
-	if (skipped.length > 0) {
-		sections.push(`Skipped: ${skipped.map((t) => `${t.id}[${t.status}]`).join(", ")}`);
+	if (selection.runnable.length > 0) {
+		sections.push(`Ready now: ${selection.runnable.map((t) => t.id).join(", ")}`);
+	}
+	if (selection.blocked.length > 0) {
+		sections.push(`Blocked (deps): ${selection.blocked.map((t) => t.id).join(", ")}`);
+	}
+	if (selection.skipped.length > 0) {
+		sections.push(`Skipped: ${selection.skipped.map((t) => `${t.id}[${t.status}]`).join(", ")}`);
+	}
+	if (opts.parallel > 1) {
+		sections.push("Parallel mode: no TUI loader — tail `.agent/traces/T00N/*.live.log` per task");
 	}
 
 	let succeeded = 0;
 	let failed = 0;
 	const failures: string[] = [];
-	const batchDeps = foremanTaskDeps(pi, ctx);
 
-	for (const task of runnable) {
-		updateBoulderProgress(ctx.cwd, { current_task_id: task.id });
-		try {
-			sections.push(`### ${task.id}`, await execTask(pi, ctx, task.id, opts.worker, batchDeps));
-			succeeded++;
-		} catch (err) {
-			failed++;
-			const message = err instanceof Error ? err.message : String(err);
-			failures.push(`${task.id}: ${message.split("\n")[0]}`);
-			sections.push(`### ${task.id} — FAILED`, message);
+	const recordFailure = (taskId: string, message: string): void => {
+		failed++;
+		const firstLine = message.split("\n")[0] ?? "exec failed";
+		failures.push(`${taskId}: ${firstLine}`);
+		sections.push(`### ${taskId} — FAILED`, message);
+		if (boulder) {
+			saveBoulder(ctx.cwd, {
+				...loadBoulder(ctx.cwd)!,
+				current_task_id: taskId,
+				batch: {
+					mode: "exec",
+					worker: opts.worker,
+					started_at: batchStartedAt,
+					stopped_at: new Date().toISOString(),
+					stopped_reason: firstLine,
+				},
+			});
+		}
+	};
 
-			if (boulder) {
-				saveBoulder(ctx.cwd, {
-					...loadBoulder(ctx.cwd)!,
-					current_task_id: task.id,
-					batch: {
-						mode: "exec",
-						worker: opts.worker,
-						started_at: batchStartedAt,
-						stopped_at: new Date().toISOString(),
-						stopped_reason: message.split("\n")[0] ?? "exec failed",
-					},
-				});
+	const stopBatchEarly = (taskId: string): string => {
+		const taskIdx = selection.plan.taskIds.indexOf(taskId);
+		const nextTaskId = taskIdx >= 0 ? selection.plan.taskIds[taskIdx + 1] : undefined;
+		sections.push(
+			"",
+			`Batch stopped at ${taskId} (${succeeded} ok, ${failed} failed).`,
+			`Resume: /agent resume`,
+			`Retry: /agent exec --all --from ${taskId} --worker ${opts.worker}`,
+		);
+		if (nextTaskId) {
+			sections.push(`Skip to ${nextTaskId}: /agent exec --all --from ${nextTaskId} --worker ${opts.worker}`);
+		}
+		sections.push(`Or: /agent exec --all --continue-on-error --worker ${opts.worker}`);
+		return sections.join("\n\n");
+	};
+
+	while (pending.size > 0) {
+		const ready = [...pending].filter((id) => {
+			const task = loadTask(ctx.cwd, id);
+			return task && isExecRunnable(task.status) && areExecDepsMet(task, ctx.cwd);
+		});
+
+		if (ready.length === 0) break;
+
+		const chunk = ready.slice(0, opts.parallel);
+		const batchDeps = foremanTaskDeps(pi, ctx, { silent: opts.parallel > 1 });
+
+		const runOne = async (taskId: string) => {
+			updateBoulderProgress(ctx.cwd, { current_task_id: taskId });
+			try {
+				const summary = await execTask(pi, ctx, taskId, opts.worker, batchDeps);
+				return { taskId, ok: true as const, summary };
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				return { taskId, ok: false as const, message };
 			}
+		};
 
-			if (!opts.continueOnError) {
-				const taskIdx = plan.taskIds.indexOf(task.id);
-				const nextTaskId = taskIdx >= 0 ? plan.taskIds[taskIdx + 1] : undefined;
-				sections.push(
-					"",
-					`Batch stopped at ${task.id} (${succeeded} ok, ${failed} failed).`,
-					`Resume: /agent resume`,
-					`Retry: /agent exec --all --from ${task.id} --worker ${opts.worker}`,
-				);
-				if (nextTaskId) {
-					sections.push(`Skip to ${nextTaskId}: /agent exec --all --from ${nextTaskId} --worker ${opts.worker}`);
+		const outcomes = await Promise.all(chunk.map(runOne));
+		for (const outcome of outcomes) {
+			pending.delete(outcome.taskId);
+			if (outcome.ok) {
+				sections.push(`### ${outcome.taskId}`, outcome.summary);
+				succeeded++;
+			} else {
+				recordFailure(outcome.taskId, outcome.message);
+				if (!opts.continueOnError) {
+					return stopBatchEarly(outcome.taskId);
 				}
-				sections.push(`Or: /agent exec --all --continue-on-error --worker ${opts.worker}`);
-				return sections.join("\n\n");
 			}
 		}
+	}
+
+	if (pending.size > 0) {
+		sections.push(`Still blocked (deps): ${[...pending].join(", ")}`);
 	}
 
 	if (boulder && failed === 0) {
@@ -202,14 +247,11 @@ async function runExecAll(
 		});
 	}
 
-	sections.push(
-		"",
-		`Batch complete: ${succeeded} succeeded${failed > 0 ? `, ${failed} failed` : ""}.`,
-	);
+	sections.push("", `Batch complete: ${succeeded} succeeded${failed > 0 ? `, ${failed} failed` : ""}.`);
 	if (failures.length > 0) {
 		sections.push(`Failures:\n${failures.map((f) => `- ${f}`).join("\n")}`);
 	}
-	sections.push("", "Next: /agent review --all  (or /agent review T00N for one task)");
+	sections.push("", "Next: /agent review --all  (review stays serial; or /agent review T00N)");
 
 	return sections.join("\n\n");
 }
@@ -387,6 +429,7 @@ export async function runResume(
 		worker: request.worker,
 		fromTaskId: request.fromTaskId,
 		continueOnError,
+		parallel: 1,
 	});
 
 	return `${header}\n\n${body}`;
@@ -407,7 +450,7 @@ export async function dispatchAgentCommand(
 			"                                     Exec + review (+ 1 retry if fail)",
 			"/agent exec T001 [--worker claude]   Execute one task",
 			"/agent exec --all [--worker claude]  Exec all pending/review_fail in active plan",
-			"                                     [--from T003] [--continue-on-error]",
+			"                                     [--parallel N] [--from T003] [--continue-on-error]",
 			"/agent resume                        Resume last stopped exec batch (boulder.json)",
 			"                                     [--continue-on-error] · resume status",
 			"/agent review T001 [--reviewer claude|codex]",

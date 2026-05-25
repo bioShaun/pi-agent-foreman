@@ -13,3 +13,4 @@ Rules:
 - Keep scope tight — only what the task asks
 - Run relevant tests or type checks if the project has them
 - Summarize what you changed when done
+- **Never** delete, move, or `git stash -u` the `.agent/` directory — it holds foreman task state (`.agent/tasks/*.json`)

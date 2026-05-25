@@ -219,23 +219,36 @@ export function loadReviewContext(
 	reviewVerdictPath: string | undefined,
 	taskId: string,
 ): ReviewContext | undefined {
-	if (!reviewMdPath || !existsSync(reviewMdPath)) return undefined;
+	const mdExists = Boolean(reviewMdPath && existsSync(reviewMdPath));
+	const verdictExists = Boolean(reviewVerdictPath && existsSync(reviewVerdictPath));
+	if (!mdExists && !verdictExists) return undefined;
 
-	const runId = runIdFromReviewPath(reviewMdPath);
+	const runId = mdExists
+		? runIdFromReviewPath(reviewMdPath!)
+		: runIdFromReviewPath(reviewVerdictPath!.replace(/\.json$/i, ".md"));
+
 	let payload = loadReviewVerdictJson(reviewVerdictPath);
 	let rawReview: string | undefined;
 
-	try {
-		rawReview = readFileSync(reviewMdPath, "utf-8");
-	} catch {
-		return undefined;
+	if (mdExists) {
+		try {
+			rawReview = readFileSync(reviewMdPath!, "utf-8");
+		} catch {
+			// md path recorded but unreadable — fall back to JSON if present
+		}
 	}
 
 	if (!payload && rawReview) {
 		payload = extractReviewVerdictFromBody(rawReview, taskId, runId);
 	}
 
-	return { runId, payload, rawReview };
+	if (!payload && !rawReview) return undefined;
+
+	return {
+		runId: payload?.review_run_id ?? runId,
+		payload,
+		rawReview,
+	};
 }
 
 export function formatFindingsSummary(payload: ReviewVerdictPayload): string {

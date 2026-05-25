@@ -86,6 +86,8 @@ export interface AgentTask {
 	planId: string;
 	title: string;
 	status: TaskStatus;
+	/** Upstream task IDs that must finish exec before this task runs. */
+	depends_on?: string[];
 	worker?: Worker;
 	prompt: string;
 	artifacts: {
@@ -107,5 +109,5 @@ export interface AgentTask {
 
 export interface ParsedPlan {
 	goal: string;
-	tasks: Array<{ id?: string; title: string; prompt: string }>;
+	tasks: Array<{ id?: string; title: string; prompt: string; depends_on?: string[] }>;
 }

@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { AGENT_DIR, agentRoot } from "./agent-paths.ts";
+import { validateDependsOn } from "./task-deps.ts";
 import type {
 	AgentBoulder,
 	AgentManifest,
@@ -51,6 +52,20 @@ export function loadTask(cwd: string, taskId: string): AgentTask | null {
 	const path = join(agentRoot(cwd), "tasks", `${taskId}.json`);
 	if (!existsSync(path)) return null;
 	return JSON.parse(readFileSync(path, "utf-8")) as AgentTask;
+}
+
+export function requireTask(cwd: string, taskId: string): AgentTask {
+	const path = join(agentRoot(cwd), "tasks", `${taskId}.json`);
+	const task = loadTask(cwd, taskId);
+	if (task) return task;
+	throw new Error(
+		[
+			`Task not found: ${taskId}`,
+			`Expected: ${path}`,
+			"Foreman task JSON may have been removed mid-run (common: worker ran `git stash -u` on untracked `.agent/`).",
+			"Recover: `git stash list` then `git checkout stash@{N} -- .agent/tasks/` (and `.agent/manifest.json` `.agent/plans/` if needed).",
+		].join("\n"),
+	);
 }
 
 export function saveTask(cwd: string, task: AgentTask): void {
@@ -125,20 +140,30 @@ export function createPlanFromParsed(cwd: string, goal: string, raw: string, par
 			? parsed.tasks
 			: [{ title: goal, prompt: `Implement the following goal:\n\n${goal}\n\nUse the plan below:\n\n${raw}` }];
 
-	for (const item of tasks) {
-		const taskId = item.id?.match(/^T\d+$/i) ? item.id.toUpperCase() : nextTaskId(cwd);
+	const planned = tasks.map((item) => ({
+		...item,
+		id: item.id?.match(/^T\d+$/i) ? item.id.toUpperCase() : nextTaskId(cwd),
+	}));
+
+	const plannedIds = planned.map((p) => p.id);
+	for (const item of planned) {
+		validateDependsOn(plannedIds, item.depends_on, item.id);
+	}
+
+	for (const item of planned) {
 		const task: AgentTask = {
-			id: taskId,
+			id: item.id,
 			planId,
 			title: item.title,
 			status: "pending",
 			prompt: item.prompt,
+			depends_on: item.depends_on,
 			artifacts: {},
 			runs: [],
 			timestamps: { created: new Date().toISOString() },
 		};
 		saveTask(cwd, task);
-		taskIds.push(taskId);
+		taskIds.push(item.id);
 	}
 
 	const plan: AgentPlan = {
@@ -161,8 +186,7 @@ export function updateTaskStatus(
 	status: TaskStatus,
 	patch?: Partial<AgentTask> & { run?: TaskRun },
 ): AgentTask {
-	const task = loadTask(cwd, taskId);
-	if (!task) throw new Error(`Task not found: ${taskId}`);
+	const task = requireTask(cwd, taskId);
 	const { run, artifacts, timestamps, ...rest } = patch ?? {};
 	const runs = run ? [...(task.runs ?? []), run] : task.runs;
 	const updated: AgentTask = {

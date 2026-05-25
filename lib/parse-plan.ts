@@ -1,3 +1,4 @@
+import { normalizeDependsOn } from "./task-deps.ts";
 import type { ParsedPlan } from "./types.ts";
 
 export function parsePlanOutput(raw: string, fallbackGoal: string): ParsedPlan {
@@ -6,13 +7,20 @@ export function parsePlanOutput(raw: string, fallbackGoal: string): ParsedPlan {
 		try {
 			const data = JSON.parse(jsonMatch[1]) as {
 				goal?: string;
-				tasks?: Array<{ id?: string; title?: string; prompt?: string; description?: string }>;
+				tasks?: Array<{
+					id?: string;
+					title?: string;
+					prompt?: string;
+					description?: string;
+					depends_on?: unknown;
+				}>;
 			};
 			const goal = data.goal?.trim() || fallbackGoal;
 			const tasks = (data.tasks ?? []).map((t, i) => ({
 				id: t.id,
 				title: t.title?.trim() || t.description?.trim() || `Task ${i + 1}`,
 				prompt: t.prompt?.trim() || t.description?.trim() || t.title?.trim() || goal,
+				depends_on: normalizeDependsOn(t.depends_on),
 			}));
 			if (tasks.length > 0) return { goal, tasks };
 		} catch {

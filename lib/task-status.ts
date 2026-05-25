@@ -47,5 +47,7 @@ export function statusIcon(status: TaskStatus): string {
 }
 
 export function statusLabel(task: AgentTask): string {
-	return `${statusIcon(task.status)} ${task.id} [${task.status}] ${task.title}${task.worker ? ` (${task.worker})` : ""}`;
+	const deps =
+		task.depends_on?.length ? ` · deps ${task.depends_on.join(",")}` : "";
+	return `${statusIcon(task.status)} ${task.id} [${task.status}] ${task.title}${deps}${task.worker ? ` (${task.worker})` : ""}`;
 }

@@ -1,7 +1,8 @@
 import { summarizeShellCommand } from "./format-display.ts";
 
 const MAX_RECENT = 80;
-const TAIL_LINES = 8;
+/** Max lines shown in loader after folding consecutive same-tool commands. */
+const TAIL_LINES = 5;
 
 function tail(text: string, lines: number): string {
 	const parts = text.trim().split("\n");
@@ -18,8 +19,127 @@ export function formatElapsed(ms: number): string {
 	return `${Math.floor(s / 60)}m ${s % 60}s`;
 }
 
-export function buildLoaderBody(recentLines: string[], fallback: string): string {
-	return recentLines.length > 0 ? tail(recentLines.join("\n"), TAIL_LINES) : fallback;
+/** Group key for collapsing repeated tool commands in the loader (display only). */
+export function foldProgressKey(line: string): string | null {
+	const t = line.trim();
+	if (!t.startsWith("$ ")) return null;
+	const body = t.slice(2).replace(/ \(failed\)$/, "");
+	if (/^(Starting |Working|Authenticated)/.test(body)) return null;
+
+	if (/(?:^|[;\s]|&&)\s*(?:\S+\/)?pytest\b/i.test(body)) return "pytest";
+	if (/\bruff\b/i.test(body)) return "ruff";
+	if (/\bpyright\b/i.test(body)) return "pyright";
+	if (/\bpython3?\b/i.test(body)) return "python";
+	if (/^git\b/i.test(body)) return "git";
+
+	const verb = body.match(/^(\w+)/)?.[1]?.toLowerCase();
+	if (verb && ["read", "list", "grep", "glob", "edit", "find", "check", "permission", "mcp", "task"].includes(verb)) {
+		return verb;
+	}
+	return null;
+}
+
+interface ProgressFoldGroup {
+	id: string;
+	key: string;
+	lines: string[];
+}
+
+export type ProgressEntry = { kind: "line"; line: string } | { kind: "fold"; fold: ProgressFoldGroup };
+
+export interface ProgressViewLine {
+	raw: string;
+	foldId?: string;
+	isFoldHeader?: boolean;
+	isFoldChild?: boolean;
+}
+
+export interface ProgressViewOptions {
+	expandedFoldIds: ReadonlySet<string>;
+	tailLines?: number;
+}
+
+function buildProgressEntries(lines: string[]): ProgressEntry[] {
+	const out: ProgressEntry[] = [];
+	let i = 0;
+	while (i < lines.length) {
+		const line = lines[i]!;
+		const key = foldProgressKey(line);
+		if (!key) {
+			out.push({ kind: "line", line });
+			i++;
+			continue;
+		}
+		const startIdx = i;
+		const groupLines = [line];
+		i++;
+		while (i < lines.length && foldProgressKey(lines[i]!) === key) {
+			groupLines.push(lines[i]!);
+			i++;
+		}
+		if (groupLines.length === 1) {
+			out.push({ kind: "line", line: groupLines[0]! });
+		} else {
+			out.push({
+				kind: "fold",
+				fold: { id: `${key}@${startIdx}`, key, lines: groupLines },
+			});
+		}
+	}
+	return out;
+}
+
+function formatFoldHeader(fold: ProgressFoldGroup, expanded: boolean): string {
+	const latest = fold.lines[fold.lines.length - 1]!;
+	const failed = latest.endsWith(" (failed)");
+	const body = latest.slice(2).replace(/ \(failed\)$/, "");
+	const detail = summarizeShellCommand(body);
+	const marker = expanded ? "▾" : "▸";
+	return `$ ${fold.key} × ${fold.lines.length}  ${marker} ${detail}${failed ? " (failed)" : ""}`;
+}
+
+function flattenProgressEntries(entries: ProgressEntry[], expandedFoldIds: ReadonlySet<string>): ProgressViewLine[] {
+	const flat: ProgressViewLine[] = [];
+	for (const entry of entries) {
+		if (entry.kind === "line") {
+			flat.push({ raw: entry.line });
+			continue;
+		}
+		const { fold } = entry;
+		const expanded = expandedFoldIds.has(fold.id);
+		flat.push({ raw: formatFoldHeader(fold, expanded), foldId: fold.id, isFoldHeader: true });
+		if (expanded) {
+			for (const line of fold.lines) {
+				flat.push({
+					raw: `  · ${line.slice(2)}`,
+					foldId: fold.id,
+					isFoldChild: true,
+				});
+			}
+		}
+	}
+	return flat;
+}
+
+function tailProgressViewLines(lines: ProgressViewLine[], max: number): ProgressViewLine[] {
+	if (lines.length <= max) return lines;
+	let start = lines.length - max;
+	if (lines[start]?.isFoldChild && lines[start]?.foldId) {
+		const id = lines[start]!.foldId!;
+		while (start > 0 && lines[start - 1]?.foldId === id) start--;
+		if (lines[start - 1]?.isFoldHeader && lines[start - 1]?.foldId === id) start--;
+	}
+	return lines.slice(start);
+}
+
+export function buildProgressViewLines(lines: string[], options: ProgressViewOptions): ProgressViewLine[] {
+	const entries = buildProgressEntries(lines);
+	const flat = flattenProgressEntries(entries, options.expandedFoldIds);
+	return tailProgressViewLines(flat, options.tailLines ?? TAIL_LINES);
+}
+
+export function foldHeaderIds(viewLines: ProgressViewLine[]): string[] {
+	return viewLines.flatMap((line) => (line.isFoldHeader && line.foldId ? [line.foldId] : []));
 }
 
 export interface LoaderOptions {

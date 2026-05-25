@@ -1,14 +1,17 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
-import { Container, matchesKey, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { watchAntigravityProgress } from "./antigravity-progress.ts";
 import { shortenDisplayPath } from "./format-display.ts";
 import { buildThemedLoaderPinned, buildThemedLoaderProgress } from "./loader-theme.ts";
 import { appendLiveLog, ensureLiveOutputSection, initLiveLog } from "./live-log.ts";
 import {
+	buildProgressViewLines,
+	foldHeaderIds,
 	isLoaderProgressLine,
 	loaderFallback,
 	pushDisplayLine,
+	type ProgressViewLine,
 	usesStructuredProgress,
 } from "./run-display.ts";
 import { spawnProcess, type RunResult } from "./spawn-process.ts";
@@ -68,17 +71,21 @@ export async function runWithLoader(
 
 	const structured = usesStructuredProgress(options);
 
-	return ctx.ui.custom<RunResult>((tui, theme, _kb, done) => {
+	const MOUSE_TRACKING_ON = "\x1b[?1006h\x1b[?1000h";
+	const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1000l";
+
+	return ctx.ui.custom<RunResult>((tui, theme, kb, done) => {
 		const container = new Container();
 		const border = new DynamicBorder((s: string) => theme.fg("border", s));
 		const pinnedOutput = new Text("", 1, 0);
 		const progressOutput = new Text("", 1, 0);
+		const footerOutput = new Text("", 1, 0);
 
 		container.addChild(border);
 		container.addChild(pinnedOutput);
 		container.addChild(progressOutput);
 		container.addChild(new Spacer(1));
-		container.addChild(new Text(theme.fg("dim", `Esc cancel · tail -f ${liveHint}`), 1, 0));
+		container.addChild(footerOutput);
 		container.addChild(border);
 
 		const redraw = () => {
@@ -87,14 +94,95 @@ export async function runWithLoader(
 		};
 
 		const recentLines: string[] = [];
+		const expandedFoldIds = new Set<string>();
+		let selectedFoldId: string | undefined;
 		const started = Date.now();
 		let outputSectionOpen = !structured;
 		const fallback = loaderFallback(options);
+		let mouseTracking = false;
+		let componentLineCount = 0;
+		const foldHeaderAtLine = new Map<number, string>();
+		let cachedViewLines: ProgressViewLine[] = [];
+
+		const updateLayoutHints = (pinnedLineCount: number, viewLines: ProgressViewLine[]) => {
+			const progressStart = 1 + pinnedLineCount;
+			foldHeaderAtLine.clear();
+			for (let i = 0; i < viewLines.length; i++) {
+				const line = viewLines[i]!;
+				if (line.isFoldHeader && line.foldId) {
+					foldHeaderAtLine.set(progressStart + i, line.foldId);
+				}
+			}
+			componentLineCount = 1 + pinnedLineCount + viewLines.length + 1 + 1 + 1;
+		};
+
+		const setFoldExpanded = (foldId: string, expanded: boolean) => {
+			selectedFoldId = foldId;
+			if (expanded) expandedFoldIds.add(foldId);
+			else expandedFoldIds.delete(foldId);
+		};
+
+		const toggleFold = (foldId: string) => {
+			setFoldExpanded(foldId, !expandedFoldIds.has(foldId));
+		};
+
+		const resolveSelectedFoldId = (headers: string[]): string | undefined => {
+			if (headers.length === 0) return undefined;
+			if (selectedFoldId && headers.includes(selectedFoldId)) return selectedFoldId;
+			return headers[headers.length - 1];
+		};
+
+		const enableMouseTracking = () => {
+			if (mouseTracking) return;
+			tui.terminal.write(MOUSE_TRACKING_ON);
+			mouseTracking = true;
+		};
+
+		const disableMouseTracking = () => {
+			if (!mouseTracking) return;
+			tui.terminal.write(MOUSE_TRACKING_OFF);
+			mouseTracking = false;
+		};
+
+		const toggleSelectedFold = () => {
+			const foldId = resolveSelectedFoldId(foldHeaderIds(cachedViewLines));
+			if (foldId) toggleFold(foldId);
+		};
+
+		const moveFoldSelection = (delta: number) => {
+			const headers = foldHeaderIds(cachedViewLines);
+			if (headers.length === 0) return;
+			const current = resolveSelectedFoldId(headers);
+			const index = current ? headers.indexOf(current) : headers.length - 1;
+			selectedFoldId = headers[(index + delta + headers.length) % headers.length];
+		};
+
+		const refreshFooter = (hasFolds: boolean) => {
+			if (hasFolds) enableMouseTracking();
+			const hint = hasFolds
+				? `Enter/点击 展开 · ↑↓ 选择 · Esc cancel · tail -f ${liveHint}`
+				: `Esc cancel · tail -f ${liveHint}`;
+			footerOutput.setText(theme.fg("dim", hint));
+		};
 
 		const refresh = () => {
 			const elapsedMs = Date.now() - started;
-			pinnedOutput.setText(buildThemedLoaderPinned(theme, label, elapsedMs, loaderContext));
-			progressOutput.setText(buildThemedLoaderProgress(theme, recentLines, fallback));
+			cachedViewLines = buildProgressViewLines(recentLines, { expandedFoldIds });
+			const headers = foldHeaderIds(cachedViewLines);
+			selectedFoldId = resolveSelectedFoldId(headers);
+			const pinnedText = buildThemedLoaderPinned(theme, label, elapsedMs, loaderContext);
+			pinnedOutput.setText(pinnedText);
+			progressOutput.setText(
+				buildThemedLoaderProgress(
+					theme,
+					recentLines,
+					fallback,
+					{ expandedFoldIds, selectedFoldId },
+					cachedViewLines,
+				),
+			);
+			refreshFooter(headers.length > 0);
+			updateLayoutHints(pinnedText.split("\n").length, cachedViewLines);
 			redraw();
 		};
 
@@ -146,14 +234,75 @@ export async function runWithLoader(
 		void handle.result.then((result) => {
 			clearInterval(elapsedTimer);
 			agyWatcher?.stop();
+			disableMouseTracking();
 			done(result);
 		});
+
+		const isMousePress = (data: string): number | null => {
+			const match = data.match(/^\x1b\[<(\d+);\d+;(\d+)([mM])$/);
+			if (!match) return null;
+			const button = Number(match[1]);
+			const release = match[3] === "m";
+			if (release || (button !== 0 && button !== 32)) return null;
+			return Number(match[2]);
+		};
+
+		const handleMousePress = (row: number) => {
+			if (componentLineCount <= 0) {
+				toggleSelectedFold();
+				return;
+			}
+			const topRow = Math.max(1, tui.terminal.rows - componentLineCount + 1);
+			const relLine = row - topRow;
+			const foldId = foldHeaderAtLine.get(relLine);
+			if (foldId) toggleFold(foldId);
+			else toggleSelectedFold();
+		};
 
 		return {
 			render: (width: number) => container.render(width),
 			invalidate: redraw,
+			dispose: () => disableMouseTracking(),
 			handleInput: (data: string) => {
-				if (matchesKey(data, "escape")) {
+				const mouseRow = isMousePress(data);
+				if (mouseRow !== null) {
+					handleMousePress(mouseRow);
+					scheduleRefresh();
+					return;
+				}
+				if (kb.matches(data, "tui.select.up")) {
+					moveFoldSelection(-1);
+					scheduleRefresh();
+					return;
+				}
+				if (kb.matches(data, "tui.select.down")) {
+					moveFoldSelection(1);
+					scheduleRefresh();
+					return;
+				}
+				if (kb.matches(data, "tui.select.confirm") || kb.matches(data, " ")) {
+					toggleSelectedFold();
+					scheduleRefresh();
+					return;
+				}
+				if (kb.matches(data, "tui.editor.cursorRight")) {
+					const foldId = resolveSelectedFoldId(foldHeaderIds(cachedViewLines));
+					if (foldId) {
+						setFoldExpanded(foldId, true);
+						scheduleRefresh();
+					}
+					return;
+				}
+				if (kb.matches(data, "tui.editor.cursorLeft")) {
+					const foldId = resolveSelectedFoldId(foldHeaderIds(cachedViewLines));
+					if (foldId) {
+						setFoldExpanded(foldId, false);
+						scheduleRefresh();
+					}
+					return;
+				}
+				if (kb.matches(data, "escape")) {
+					disableMouseTracking();
 					agyWatcher?.stop();
 					handle.kill();
 				}
@@ -168,13 +317,29 @@ export async function which(pi: ExtensionAPI, cwd: string, bin: string): Promise
 	return result.code === 0 && result.stdout.trim().length > 0;
 }
 
+export const MAX_EXEC_PARALLEL = 8;
+
+export function parseParallelFlag(trimmed: string): number {
+	const match = trimmed.match(/--parallel\s+(\d+)/i);
+	if (!match) return 1;
+	const n = Number.parseInt(match[1]!, 10);
+	if (!Number.isFinite(n) || n < 1) {
+		throw new Error("--parallel must be a positive integer");
+	}
+	return Math.min(n, MAX_EXEC_PARALLEL);
+}
+
 export function parseExecArgs(
 	args: string,
 	defaultWorker: Worker = "claude",
-): { mode: "single"; taskId: string; worker: Worker } | { mode: "batch"; worker: Worker; fromTaskId?: string; continueOnError: boolean } {
+):
+	| { mode: "single"; taskId: string; worker: Worker }
+	| { mode: "batch"; worker: Worker; fromTaskId?: string; continueOnError: boolean; parallel: number } {
 	const trimmed = args.trim();
 	if (!trimmed) {
-		throw new Error("Usage: /agent exec T001 [--worker claude|codex|antigravity] | /agent exec --all [--worker claude] [--from T003] [--continue-on-error]");
+		throw new Error(
+			"Usage: /agent exec T001 [--worker claude|codex|antigravity] | /agent exec --all [--worker claude] [--parallel N] [--from T003] [--continue-on-error]",
+		);
 	}
 
 	if (/^--all\b/i.test(trimmed)) {
@@ -186,12 +351,15 @@ export function parseExecArgs(
 			worker,
 			fromTaskId: fromMatch?.[1]?.toUpperCase(),
 			continueOnError: /--continue-on-error\b/i.test(trimmed),
+			parallel: parseParallelFlag(trimmed),
 		};
 	}
 
 	const match = trimmed.match(/^(T\d+)\s*(?:--worker\s+(\w+))?/i);
 	if (!match) {
-		throw new Error("Usage: /agent exec T001 [--worker claude|codex|antigravity] | /agent exec --all [--worker claude] [--from T003] [--continue-on-error]");
+		throw new Error(
+			"Usage: /agent exec T001 [--worker claude|codex|antigravity] | /agent exec --all [--worker claude] [--parallel N] [--from T003] [--continue-on-error]",
+		);
 	}
 	const worker = parseWorker(match[2]?.toLowerCase() ?? defaultWorker, defaultWorker);
 	return { mode: "single", taskId: match[1].toUpperCase(), worker };

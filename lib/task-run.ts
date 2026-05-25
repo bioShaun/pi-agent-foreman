@@ -1,10 +1,14 @@
 import { writeFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { reviewerInvocation, workerInvocation } from "./agents.ts";
-import { runWithLoader, type RunResult } from "./run-command.ts";
+import { watchAntigravityProgress } from "./antigravity-progress.ts";
+import { appendLiveLog, initLiveLog } from "./live-log.ts";
+import { spawnProcess, type RunResult } from "./spawn-process.ts";
+import { runWithLoader } from "./run-command.ts";
+import { unmetExecDeps } from "./task-deps.ts";
 import { tailLines } from "./run-display.ts";
 import { artifactPath, createRunId, ensureRunDirs, reviewVerdictPath, tracePath } from "./agent-paths.ts";
-import { loadTask, updateTaskStatus } from "./agent-store.ts";
+import { loadTask, requireTask, updateTaskStatus } from "./agent-store.ts";
 import { writePromptSnapshot } from "./prompt-persistence.ts";
 import {
 	extractReviewVerdictFromBody,
@@ -45,10 +49,15 @@ export interface TaskRunDeps {
 	refreshWidget?: () => void;
 }
 
-export function makeTaskRunDeps(pi: ExtensionAPI, ctx: ExtensionCommandContext, refreshWidget: () => void): TaskRunDeps {
+export function makeTaskRunDeps(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	refreshWidget: () => void,
+	opts?: { silent?: boolean },
+): TaskRunDeps {
 	return {
 		cwd: ctx.cwd,
-		invoke: makeInvokeAdapter(pi, ctx),
+		invoke: opts?.silent ? makeSilentInvokeAdapter(pi, ctx) : makeInvokeAdapter(pi, ctx),
 		refreshWidget,
 	};
 }
@@ -77,6 +86,34 @@ export function makeInvokeAdapter(pi: ExtensionAPI, ctx: ExtensionCommandContext
 		});
 }
 
+export function makeSilentInvokeAdapter(_pi: ExtensionAPI, ctx: ExtensionCommandContext): InvokeAdapter {
+	return (spec) => {
+		if (spec.liveLogPath) {
+			initLiveLog(spec.liveLogPath, spec.label, spec.loaderContext);
+		}
+
+		const started = Date.now();
+		const agyWatcher = spec.antigravityProgress
+			? watchAntigravityProgress(started, (line) => appendLiveLog(spec.liveLogPath, "progress", line))
+			: undefined;
+
+		const handle = spawnProcess({
+			command: spec.command,
+			args: spec.args,
+			cwd: ctx.cwd,
+			stdin: spec.stdin,
+			timeoutMs: spec.timeoutMs,
+			jsonStream: spec.jsonStream,
+			mergeStderr: spec.antigravityProgress,
+			onProgressLine: (line) => appendLiveLog(spec.liveLogPath, "progress", line),
+		});
+
+		return handle.result.finally(() => {
+			agyWatcher?.stop();
+		});
+	};
+}
+
 function resolveExecReviewLoad(
 	task: AgentTask,
 	taskId: string,
@@ -94,9 +131,11 @@ function resolveExecReviewLoad(
 		};
 	}
 
-	const hint = task.artifacts.review
-		? `↳ review_fail · could not read ${task.artifacts.review}`
-		: "↳ review_fail · no review artifact on task";
+	const hint = task.artifacts.reviewVerdict
+		? `↳ review_fail · could not load review (missing ${task.artifacts.reviewVerdict})`
+		: task.artifacts.review
+			? `↳ review_fail · could not read ${task.artifacts.review}`
+			: "↳ review_fail · no review artifact on task";
 	return { incorporatingReview: true, loaderContext: [hint] };
 }
 
@@ -109,8 +148,12 @@ export async function runExecPhase(
 	taskId: string,
 	worker: Worker,
 ): Promise<{ summary: string; task: AgentTask }> {
-	const task = loadTask(deps.cwd, taskId);
-	if (!task) throw new Error(`Task not found: ${taskId}`);
+	const task = requireTask(deps.cwd, taskId);
+
+	const blocked = unmetExecDeps(task, deps.cwd);
+	if (blocked.length > 0) {
+		throw new Error(`${taskId} blocked by dependencies: ${blocked.join(", ")} (need exec done first)`);
+	}
 
 	const priorStatus = task.status;
 	const { incorporatingReview, reviewContext, loaderContext } = resolveExecReviewLoad(task, taskId);
@@ -215,8 +258,7 @@ export async function runReviewPhase(
 	taskId: string,
 	reviewer?: Reviewer,
 ): Promise<{ summary: string; task: AgentTask; passed: boolean }> {
-	const task = loadTask(deps.cwd, taskId);
-	if (!task) throw new Error(`Task not found: ${taskId}`);
+	const task = requireTask(deps.cwd, taskId);
 
 	const { agent, prompt, invocation } = reviewerInvocation(deps.cwd, taskId, task.title, reviewer);
 
