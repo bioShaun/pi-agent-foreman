@@ -74,8 +74,14 @@ export function spawnProcess(options: SpawnProcessOptions): SpawnProcessHandle {
 
 		const processLines = (text: string, isErr: boolean) => {
 			if (options.jsonStream) {
-				if (!isErr) lineBuffer += text;
-				else stderr += text;
+				if (isErr) {
+					// Capture stderr verbatim so callers can surface CLI errors
+					// (e.g. codex's "Not inside a trusted directory") that arrive
+					// before any JSON output. Do NOT feed it into the JSON buffer.
+					stderr += text;
+					return;
+				}
+				lineBuffer += text;
 				const lines = lineBuffer.split("\n");
 				lineBuffer = lines.pop() ?? "";
 				for (const line of lines) processJsonLine(line);
@@ -103,7 +109,10 @@ export function spawnProcess(options: SpawnProcessOptions): SpawnProcessHandle {
 
 		proc.stdout?.on("data", (chunk: Buffer) => processLines(chunk.toString(), false));
 		proc.stderr?.on("data", (chunk: Buffer) => {
-			if (options.jsonStream || options.mergeStderr) processLines(chunk.toString(), false);
+			// mergeStderr (antigravity) routes stderr into the progress/stdout path;
+			// jsonStream routes stderr to the stderr accumulator (handled inside processLines);
+			// plain mode also routes stderr to the stderr accumulator.
+			if (options.mergeStderr) processLines(chunk.toString(), false);
 			else processLines(chunk.toString(), true);
 		});
 

@@ -63,8 +63,12 @@ export async function runPlan(pi: ExtensionAPI, ctx: ExtensionCommandContext, go
 
 	if (result.killed) throw new Error("Planning cancelled");
 	if (result.code !== 0) {
+		const detail =
+			result.stderr.trim() ||
+			result.stdout.trim() ||
+			"(no stdout/stderr captured — check live trace if available)";
 		throw new Error(
-			result.stderr.trim() || result.stdout.trim() || `${agent.cli} exec failed (exit ${result.code})`,
+			`${agent.cli} exec failed (exit ${result.code})\n\n${detail.slice(0, 2000)}`,
 		);
 	}
 
