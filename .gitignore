@@ -1,4 +1,11 @@
+# Local agent / CLI state (project-specific, not shared)
+.agents/
+.antigravitycli/
+.pi/
+
+# Agent runtime artifacts
 .agent/artifacts/
 .agent/traces/
 .agent/boulder.json
+
 node_modules/
